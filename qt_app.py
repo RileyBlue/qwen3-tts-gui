@@ -21,10 +21,11 @@ import voice_library
 from audio_utils import save_outputs, write_wav, load_wav
 from config import (
     DEFAULT_ATTN, DEFAULT_DEVICE, DEFAULT_DTYPE, DEFAULT_LANGUAGE, DEFAULT_MAX_WORDS,
-    DEFAULT_MIN_WORDS, ATTNS, DTYPES, LANGUAGES, MODEL_MAP, OUTPUT_DIR,
+    DEFAULT_MIN_WORDS, ATTNS, DTYPES, LANGUAGES, MODELS, MODEL_MAP, OUTPUT_DIR,
 )
 from model_loader import ModelManager
 from qt_audiobook import AudiobookTab
+from theme import COLORS, SIDEBAR_WIDTH, apply_theme, set_role
 from tts_generator import TTSGenerator
 from voice_lock import EMOTION_PRESETS
 
@@ -34,6 +35,29 @@ DIRECTION_HELP = (
     "[shaky voice, holding back tears]. Emphasis is shaped by wording and punctuation (!, ?, …, "
     "short sentences); Qwen3-TTS has no markup for stressing single words."
 )
+
+# Optional starting points for the voice description. Selecting one appends its phrase;
+# deselecting (or editing it away) removes only that phrase, so typed text is never lost.
+SUGGESTIONS = (
+    ("Narration", "Clear, steady narrator voice, ideal for narration."),
+    ("Relaxing", "Soft, slow, soothing and relaxed delivery."),
+    ("Epic", "Deep, powerful, dramatic trailer-style voice."),
+    ("Professional", "Polished, confident, neutral professional tone."),
+)
+
+# Create Voice content stops growing past this width so wide windows leave whitespace, not stretched fields.
+CONTENT_MAX_WIDTH = 1120
+
+# Starts a Create Voice generation. Qt maps Ctrl to Command on macOS, so show the native spelling.
+GENERATE_SHORTCUT = "Ctrl+Return"
+
+
+def shortcut_text(sequence=GENERATE_SHORTCUT):
+    return QtGui.QKeySequence(sequence).toString(QtGui.QKeySequence.NativeText)
+
+
+# Preview panel pages (Create Voice).
+PV_EMPTY, PV_BUSY, PV_READY, PV_ERROR = range(4)
 
 
 def cuda_available():
@@ -101,6 +125,7 @@ def tab_page(body_layout_builder):
     """Return (page, body_layout, bar_layout): scrollable body + fixed action bar."""
     page = QtWidgets.QWidget()
     outer = QtWidgets.QVBoxLayout(page)
+    outer.setContentsMargins(24, 24, 24, 16)
     scroll = QtWidgets.QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -111,6 +136,119 @@ def tab_page(body_layout_builder):
     bar = QtWidgets.QHBoxLayout()
     outer.addLayout(bar)
     return page, body_layout, bar
+
+
+def page_header(title, subtitle=None):
+    """Screen heading: one title and at most one short description."""
+    box = QtWidgets.QWidget()
+    lay = QtWidgets.QVBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 8)
+    lay.setSpacing(4)
+    lbl = QtWidgets.QLabel(title)
+    set_role(lbl, "title")
+    lay.addWidget(lbl)
+    if subtitle:
+        sub = QtWidgets.QLabel(subtitle)
+        sub.setWordWrap(True)
+        set_role(sub, "subtitle")
+        lay.addWidget(sub)
+    return box
+
+
+def format_duration(seconds):
+    seconds = int(round(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+class WrapLabel(QtWidgets.QLabel):
+    """Word-wrapped label that reserves the height its text needs at its current width.
+
+    Box layouts don't always hand a width to height-for-width children, which clips wrapped text.
+    """
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.setWordWrap(True)
+
+    def setText(self, text):
+        super().setText(text)
+        self._fit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self):
+        height = self.heightForWidth(self.width()) if self.width() > 0 else 0
+        if height > 0 and height != self.minimumHeight():
+            self.setMinimumHeight(height)
+
+
+class PageSwitcher(QtWidgets.QWidget):
+    """Shows one page at a time. Unlike QStackedWidget, hidden pages take no part in layout, so the
+    container is exactly as tall as the visible page (a stack sizes itself to its tallest page)."""
+
+    def __init__(self):
+        super().__init__()
+        self._pages = []
+        self._index = -1
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+    def insertWidget(self, index, widget):
+        self._pages.insert(index, widget)
+        self.layout().addWidget(widget)
+        widget.setVisible(False)
+
+    def setCurrentIndex(self, index):
+        self._index = index
+        for i, page in enumerate(self._pages):
+            page.setVisible(i == index)
+
+    def currentIndex(self):
+        return self._index
+
+    def currentWidget(self):
+        return self._pages[self._index]
+
+    def widget(self, index):
+        return self._pages[index]
+
+    def count(self):
+        return len(self._pages)
+
+
+class WaveformView(QtWidgets.QWidget):
+    """Peak bars drawn from the real generated samples (no playhead: audio_player has no position)."""
+
+    BARS = 48
+
+    def __init__(self):
+        super().__init__()
+        self._peaks = []
+        self.setFixedHeight(44)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.setAccessibleName("Waveform of the generated sample")
+
+    def set_samples(self, wav):
+        a = np.abs(np.asarray(wav, dtype=np.float32)).reshape(-1)
+        peaks = [float(c.max()) for c in np.array_split(a, self.BARS) if c.size] if a.size else []
+        top = max(peaks, default=0) or 1.0
+        self._peaks = [p / top for p in peaks]
+        self.update()
+
+    def paintEvent(self, _event):
+        if not self._peaks:
+            return
+        painter = QtGui.QPainter(self)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(COLORS["text_secondary"]))
+        step = self.width() / len(self._peaks)
+        bar = max(2.0, step - 3)
+        mid = self.height() / 2
+        for i, p in enumerate(self._peaks):
+            h = max(3.0, p * self.height())
+            painter.drawRoundedRect(QtCore.QRectF(i * step, mid - h / 2, bar, h), 1.5, 1.5)
 
 
 class DirectionBar(QtWidgets.QWidget):
@@ -153,28 +291,143 @@ class MainWindow(QtWidgets.QMainWindow):
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        root = QtWidgets.QVBoxLayout(central)
-        root.addWidget(self._build_settings())
-        root.addLayout(self._build_status_bar())
-        self.tabs = QtWidgets.QTabWidget()
-        self.tabs.addTab(self._build_design_tab(), "Voice Creator (VoiceDesign)")
-        self.tabs.addTab(self._build_clone_tab(), "VoiceClone")
-        self.tabs.addTab(self._build_voices_tab(), "Voices")
+        shell = QtWidgets.QHBoxLayout(central)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+
+        # Widgets other pages depend on (status label, settings spin boxes) are built first.
+        settings_page = self._build_settings_page()
+        footer = self._build_footer()
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self._build_design_tab())
+        clone_page = self._build_clone_tab()
+        voices_page = self._build_voices_tab()
         self.audiobook_tab = AudiobookTab(self, text_edit, combo, seed_row)
-        self.tabs.addTab(self.audiobook_tab, "Audiobook")
-        root.addWidget(self.tabs, 1)
+        for dense in (clone_page, voices_page, self.audiobook_tab):  # not redesigned yet: keep them compact
+            dense.setProperty("density", "compact")
+        self.stack.addWidget(clone_page)
+        self.stack.addWidget(voices_page)
+        lay = self.audiobook_tab.layout()
+        lay.setContentsMargins(24, 24, 24, 16)
+        lay.insertWidget(0, page_header("Audiobooks"))
+        ab_scroll = QtWidgets.QScrollArea()
+        ab_scroll.setWidgetResizable(True)
+        ab_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        ab_scroll.setWidget(self.audiobook_tab)
+        self.stack.addWidget(ab_scroll)
+        self.stack.addWidget(settings_page)
+
+        shell.addWidget(self._build_sidebar(("Create Voice", "Clone Voice", "My Voices", "Audiobooks"), "Settings"))
+        main_col = QtWidgets.QVBoxLayout()
+        main_col.setContentsMargins(0, 0, 0, 0)
+        main_col.setSpacing(0)
+        main_col.addWidget(self.stack, 1)
+        main_col.addWidget(footer)
+        shell.addLayout(main_col, 1)
+        self.show_page(0)
         self.refresh_voice_lists()
 
         screen = QtGui.QGuiApplication.primaryScreen().availableGeometry()
-        self.resize(min(1100, screen.width() - 40), min(860, screen.height() - 60))
+        self.setMinimumSize(min(1024, screen.width()), min(640, screen.height()))
+        self.resize(min(1240, screen.width() - 40), min(860, screen.height() - 60))
+
+        # Buttons take keyboard focus only, so a mouse click never leaves a focus ring on
+        # the selected navigation item; the description field gets the initial focus.
+        for b in self.findChildren(QtWidgets.QPushButton):
+            b.setFocusPolicy(QtCore.Qt.TabFocus)
+        self._sync_nav_focus()  # the loop above must not give every nav item a tab stop
+        for area in self.findChildren(QtWidgets.QScrollArea):  # a scroll area is not a control: no invisible stop
+            area.setFocusPolicy(QtCore.Qt.NoFocus)
+        self._apply_tab_order()
+        self.txt_vd_instruct.setFocus()
+
+        # Ctrl+Return starts a Create Voice generation (a disabled button ignores the click).
+        QtGui.QShortcut(QtGui.QKeySequence(GENERATE_SHORTCUT), self, activated=self._shortcut_generate)
 
     # ------------------------------------------------------------------ settings / status
     def model_settings(self):
         return (self.cmb_device.currentText(), self.cmb_dtype.currentText(), self.cmb_attn.currentText())
 
-    def _build_settings(self):
-        box = QtWidgets.QGroupBox("Global Settings")
-        lay = QtWidgets.QHBoxLayout(box)
+    def _build_sidebar(self, entries, settings_label):
+        """Left navigation. Selection is a neutral surface; the accent is reserved for actions."""
+        side = QtWidgets.QFrame()
+        side.setObjectName("sidebar")
+        side.setFixedWidth(SIDEBAR_WIDTH)
+        lay = QtWidgets.QVBoxLayout(side)
+        lay.setContentsMargins(12, 16, 12, 16)
+        lay.setSpacing(4)
+        brand = QtWidgets.QLabel("Qwen3-TTS Studio")
+        set_role(brand, "brand")
+        lay.addWidget(brand)
+        lay.addSpacing(16)
+        self.nav_group = QtWidgets.QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        self.nav_buttons = []
+
+        def add_nav(label):
+            btn = QtWidgets.QPushButton(label)
+            btn.setCheckable(True)
+            btn.setToolTip(f"{label} (Ctrl+{len(self.nav_buttons) + 1})")
+            set_role(btn, "nav")
+            self.nav_group.addButton(btn, len(self.nav_buttons))
+            self.nav_buttons.append(btn)
+            lay.addWidget(btn)
+
+        for label in entries:
+            add_nav(label)
+        lay.addStretch(1)
+        add_nav(settings_label)
+        self.nav_group.idClicked.connect(self.show_page)
+        for i in range(len(self.nav_buttons)):
+            QtGui.QShortcut(QtGui.QKeySequence(f"Ctrl+{i + 1}"), self, activated=lambda i=i: self.show_page(i))
+        return side
+
+    def show_page(self, index):
+        self.stack.setCurrentIndex(index)
+        self.nav_buttons[index].setChecked(True)
+        self._sync_nav_focus()
+        self._update_footer()
+
+    def _sync_nav_focus(self):
+        # The navigation is one tab stop (the selected item); arrow keys move between items.
+        for button in self.nav_buttons:
+            button.setFocusPolicy(QtCore.Qt.TabFocus if button.isChecked() else QtCore.Qt.NoFocus)
+
+    def _apply_tab_order(self):
+        """Tab follows the visual task order: navigation, creation form, primary action, preview
+        actions, secondary settings, footer. Qt skips hidden and disabled widgets, and only the
+        checked navigation item is a stop (arrow keys move between items)."""
+        chain = [
+            *self.nav_buttons,
+            self.txt_vd_instruct, *(chip for chip, _name, _phrase in self.vd_chips), self.btn_vd_generate,
+            self.btn_vd_play, self.edt_vd_name, self.btn_vd_save, self.btn_vd_download, self.btn_vd_regenerate,
+            self.btn_vd_details, self.btn_vd_retry, self.btn_vd_error_settings,
+            self.cmb_vd_lang, self.btn_vd_advanced,
+            self.cmb_vd_seed_mode, self.spn_vd_seed, self.chk_vd_autosave, self.cmb_vd_name_gender,
+            self.btn_vd_rand_name, self.txt_vd_sample, self.btn_vd_open_settings,
+            self.btn_play_last, self.btn_stop_audio, self.btn_open_out, self.btn_stop,
+        ]
+        for first, second in zip(chain, chain[1:]):
+            QtWidgets.QWidget.setTabOrder(first, second)
+
+    def _shortcut_generate(self):
+        if self.stack.currentIndex() == 0:
+            self.btn_vd_generate.click()
+
+    def model_settings(self):
+        return (self.cmb_device.currentText(), self.cmb_dtype.currentText(), self.cmb_attn.currentText())
+
+    def _build_settings_page(self):
+        """Application-wide options (same widgets and defaults as before), grouped by scope.
+
+        Task options (language, seed, auto-save, naming) stay on the screen that uses them.
+        """
+        page = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(page)
+        outer.setContentsMargins(32, 32, 32, 24)
+        outer.setSpacing(16)
+        outer.addWidget(page_header(
+            "Settings", "Application-wide options. Language, seed and naming live on each screen."))
         self.cmb_device = combo(["cuda", "cpu"], DEFAULT_DEVICE if cuda_available() else "cpu")
         self.cmb_dtype = combo(DTYPES, DEFAULT_DTYPE)
         self.cmb_attn = combo(ATTNS, DEFAULT_ATTN)
@@ -184,29 +437,67 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spn_max = QtWidgets.QSpinBox()
         self.spn_max.setRange(0, 5000)
         self.spn_max.setValue(int(DEFAULT_MAX_WORDS))
-        for label, w in (("Device", self.cmb_device), ("Dtype", self.cmb_dtype), ("Attention", self.cmb_attn),
-                         ("Min words/chunk", self.spn_min), ("Max words/chunk", self.spn_max)):
-            lay.addWidget(QtWidgets.QLabel(label + ":"))
-            lay.addWidget(w)
-        lay.addStretch(1)
-        box.setToolTip("Models load automatically the first time a tab needs them.")
-        return box
 
-    def _build_status_bar(self):
-        lay = QtWidgets.QVBoxLayout()
+        def section(title, description, rows):
+            head = QtWidgets.QLabel(title)
+            set_role(head, "heading")
+            outer.addWidget(head)
+            desc = QtWidgets.QLabel(description)
+            desc.setWordWrap(True)
+            desc.setMaximumWidth(560)
+            set_role(desc, "muted")
+            outer.addWidget(desc)
+            form = QtWidgets.QFormLayout()
+            form.setHorizontalSpacing(16)
+            form.setVerticalSpacing(12)
+            form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+            form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            for label, w in rows:
+                lbl = QtWidgets.QLabel(label)
+                lbl.setBuddy(w)
+                form.addRow(lbl, w)
+            outer.addLayout(form)
+
+        section("Compute", "Used by every screen. Models reload when these change.",
+                (("Device", self.cmb_device), ("Dtype", self.cmb_dtype), ("Attention", self.cmb_attn)))
+        outer.addSpacing(8)
+        section("Long-form text", "Used by Clone Voice and Audiobooks. Voice creation is not split into chunks.",
+                (("Min words per chunk", self.spn_min), ("Max words per chunk", self.spn_max)))
+        outer.addSpacing(8)
+        note = QtWidgets.QLabel(
+            "Defaults are unchanged from earlier versions. flash_attention_2 targets NVIDIA GPUs with the "
+            "flash-attn package installed; behavior on other hardware has not been verified here. "
+            "Models are downloaded on first use.")
+        note.setWordWrap(True)
+        note.setMaximumWidth(560)
+        set_role(note, "muted")
+        outer.addWidget(note)
+        outer.addStretch(1)
+        return page
+
+    def _build_footer(self):
+        """Global status strip: progress, last message, and audio/output shortcuts."""
+        footer = QtWidgets.QFrame()
+        footer.setObjectName("footer")
+        lay = QtWidgets.QVBoxLayout(footer)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setTextVisible(False)
-        self.progress.setMaximumHeight(8)
+        self.progress.setMaximumHeight(3)
         lay.addWidget(self.progress)
         row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(24, 8, 24, 8)
+        row.setSpacing(8)
         self.lbl_status = QtWidgets.QLabel("Ready")
         self.lbl_status.setWordWrap(True)
+        self.lbl_status.setAccessibleName("Status")
         row.addWidget(self.lbl_status, 1)
-        self.btn_play_last = QtWidgets.QPushButton("▶ Play last output")
+        self.btn_play_last = QtWidgets.QPushButton("Play last output")
         self.btn_play_last.setEnabled(False)
         self.btn_play_last.clicked.connect(lambda: self.play(self.last_output))
-        self.btn_stop_audio = QtWidgets.QPushButton("■ Stop audio")
+        self.btn_stop_audio = QtWidgets.QPushButton("Stop audio")
         self.btn_stop_audio.clicked.connect(audio_player.stop)
         self.btn_open_out = QtWidgets.QPushButton("Open output folder")
         self.btn_open_out.clicked.connect(
@@ -214,10 +505,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_stop = QtWidgets.QPushButton("Stop generation")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.request_stop)
+        self.btn_play_last.setToolTip("Play the most recent Clone Voice or Audiobook render")
+        self.btn_stop_audio.setToolTip("Stop any audio that is playing")
+        self.btn_open_out.setToolTip("Open the folder where renders are saved")
+        self.btn_stop.setToolTip("Stop the running render after its current chunk or segment")
+        self.btn_stop.setVisible(False)
         for b in (self.btn_play_last, self.btn_stop_audio, self.btn_open_out, self.btn_stop):
+            set_role(b, "quiet")
             row.addWidget(b)
         lay.addLayout(row)
-        return lay
+        return footer
 
     def status(self, msg):
         self.lbl_status.setText(msg)
@@ -237,23 +534,39 @@ class MainWindow(QtWidgets.QMainWindow):
             self.task.stop_event.set()
             self.status("Stop requested…")
 
-    def set_busy(self, busy):
+    def set_busy(self, busy, stoppable=True):
         self.busy = busy
         self.progress.setRange(0, 0 if busy else 1)
-        self.btn_stop.setEnabled(busy)
+        # Only the clone loop and audiobook render check the stop flag; other tasks can't be cancelled.
+        self.btn_stop.setEnabled(busy and stoppable)
+        self.btn_stop.setVisible(busy and stoppable)
         for b in self.action_buttons:
             b.setEnabled(not busy)
+        self._refresh_save_button()  # re-enabling everything must not enable Save without a sample or name
 
-    def run_task(self, fn, on_done):
+    def _update_footer(self):
+        # Create Voice has its own Play; "last output" only applies to Clone Voice and Audiobook renders.
+        self.btn_play_last.setVisible(self.stack.currentIndex() != 0)
+
+    def run_task(self, fn, on_done, on_fail=None, on_notify=None, stoppable=True):
         if self.busy:
             self.status("Busy: a task is already running.")
             return
         task = Task()
         self.task = task
         task.notify.connect(self.status)
+        if on_notify:
+            task.notify.connect(on_notify)
+
+        def failed(message):
+            self.set_busy(False)
+            self.status(f"Error: {message}")
+            if on_fail:
+                on_fail(message)
+
         task.done.connect(lambda r: (self.set_busy(False), on_done(r)))
-        task.failed.connect(lambda m: (self.set_busy(False), self.status(f"Error: {m}")))
-        self.set_busy(True)
+        task.failed.connect(failed)
+        self.set_busy(True, stoppable)
         task.start(fn)
 
     def generator(self, task):
@@ -279,70 +592,506 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------ Voice Creator
     def _build_design_tab(self):
-        page, lay, bar = tab_page(None)
-        lay.addWidget(QtWidgets.QLabel("Sample text (fixed — every voice is auditioned on the same passage):"))
-        lay.addWidget(text_edit(6, text=voice_library.SAMPLE_TEXT, read_only=True))
+        page = QtWidgets.QScrollArea()
+        page.setWidgetResizable(True)
+        page.setFrameShape(QtWidgets.QFrame.NoFrame)
+        body = QtWidgets.QWidget()
+        page.setWidget(body)
+        frame = QtWidgets.QHBoxLayout(body)
+        frame.setContentsMargins(32, 32, 32, 24)
+        self.vd_content = QtWidgets.QWidget()
+        self.vd_content.setMaximumWidth(CONTENT_MAX_WIDTH)
+        frame.addWidget(self.vd_content, 100, QtCore.Qt.AlignTop)
+        frame.addStretch(1)
+        outer = QtWidgets.QVBoxLayout(self.vd_content)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(24)
 
-        lay.addWidget(QtWidgets.QLabel("Voice description:"))
+        outer.addWidget(page_header(
+            "Create a voice with AI", "Describe how you want it to sound, then listen to a sample."))
+        cols = QtWidgets.QHBoxLayout()
+        cols.setSpacing(32)
+        cols.addLayout(self._build_creation_column(), 5)
+        cols.addWidget(self._build_preview_panel(), 4, QtCore.Qt.AlignTop)
+        outer.addLayout(cols)
+
+        divider = QtWidgets.QFrame()
+        set_role(divider, "divider")
+        outer.addWidget(divider)
+        outer.addLayout(self._build_options_strip())
+        self.vd_advanced = self._build_advanced_panel()
+        self.vd_advanced.setVisible(False)
+        outer.addWidget(self.vd_advanced)
+
+        self.txt_vd_instruct.textChanged.connect(self._on_description_changed)
+        self.cmb_vd_lang.currentTextChanged.connect(lambda _t: self._refresh_stale_note())
+        for cmb in (self.cmb_device, self.cmb_dtype, self.cmb_attn):
+            cmb.currentTextChanged.connect(lambda _t: self._update_compute_summary())
+        self._update_compute_summary()
+        self._set_preview(PV_EMPTY)
+        return page
+
+    # ---- left column: describe and generate
+    def _build_creation_column(self):
+        col = QtWidgets.QVBoxLayout()
+        col.setSpacing(12)
+        lbl = QtWidgets.QLabel("Voice description")
+        self.lbl_vd_description = lbl
+        set_role(lbl, "field")
+        col.addWidget(lbl)
         self.txt_vd_instruct = text_edit(
-            5, "Describe timbre, age, gender, pace, accent, mood…",
+            4, "e.g. A warm, calm voice with a friendly tone",
             "Warm, gentle female voice, calm and soothing tone.")
-        lay.addWidget(self.txt_vd_instruct)
+        self.txt_vd_instruct.setFixedHeight(112)
+        self.txt_vd_instruct.setTabChangesFocus(True)  # Tab/Shift+Tab leave the field; Enter still adds a line
+        self.txt_vd_instruct.setAccessibleName("Voice description")
+        lbl.setBuddy(self.txt_vd_instruct)
+        col.addWidget(self.txt_vd_instruct)
+        self.lbl_vd_field_error = QtWidgets.QLabel("Describe how you want the voice to sound.")
+        set_role(self.lbl_vd_field_error, "error-text")
+        self.lbl_vd_field_error.setVisible(False)
+        col.addWidget(self.lbl_vd_field_error)
 
-        form = QtWidgets.QFormLayout()
+        caption = QtWidgets.QLabel("Suggestions")
+        set_role(caption, "caption")
+        col.addWidget(caption)
+        chips = QtWidgets.QHBoxLayout()
+        chips.setSpacing(8)
+        self.vd_chips = []
+        for name, phrase in SUGGESTIONS:
+            chip = QtWidgets.QPushButton(name)
+            chip.setCheckable(True)
+            chip.setToolTip(f"Add to the description: {phrase}")
+            set_role(chip, "chip")
+            chip.toggled.connect(lambda on, ph=phrase: self._toggle_suggestion(ph, on))
+            self.vd_chips.append((chip, name, phrase))
+            chips.addWidget(chip)
+        chips.addStretch(1)
+        col.addLayout(chips)
+
+        col.addSpacing(8)
+        gen = QtWidgets.QHBoxLayout()
+        self.btn_vd_generate = QtWidgets.QPushButton("Generate voice")
+        set_role(self.btn_vd_generate, "primary")
+        self.btn_vd_generate.setMinimumWidth(180)
+        self.btn_vd_generate.setToolTip(f"Generate voice ({shortcut_text()})")
+        self.btn_vd_generate.setAccessibleDescription(f"Keyboard shortcut {shortcut_text()}")
+        self.btn_vd_generate.clicked.connect(self.generate_sample)
+        gen.addWidget(self.btn_vd_generate)
+        gen.addSpacing(12)
+        self.lbl_vd_shortcut = QtWidgets.QLabel(f"or press {shortcut_text()}")
+        set_role(self.lbl_vd_shortcut, "muted")
+        gen.addWidget(self.lbl_vd_shortcut)
+        gen.addStretch(1)
+        col.addLayout(gen)
+        col.addStretch(1)
+        return col
+
+    # ---- right column: preview states
+    def _build_preview_panel(self):
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("previewPanel")
+        self.preview_panel = panel
+        panel.setMinimumWidth(340)
+        lay = QtWidgets.QVBoxLayout(panel)
+        lay.setContentsMargins(20, 16, 20, 20)
+        lay.setSpacing(12)
+
+        head = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Preview")
+        self.lbl_vd_preview_title = title
+        set_role(title, "heading")
+        head.addWidget(title)
+        head.addStretch(1)
+        self.lbl_vd_duration = QtWidgets.QLabel("")
+        set_role(self.lbl_vd_duration, "pill")
+        self.lbl_vd_duration.setToolTip("Length of the generated sample")
+        self.lbl_vd_duration.setAccessibleName("Sample length")
+        self.lbl_vd_duration.setVisible(False)
+        head.addWidget(self.lbl_vd_duration)
+        lay.addLayout(head)
+
+        self.vd_preview = PageSwitcher()
+        lay.addWidget(self.vd_preview)
+
+        # empty
+        empty = QtWidgets.QWidget()
+        em = QtWidgets.QVBoxLayout(empty)
+        em.setContentsMargins(0, 0, 0, 0)
+        em.setSpacing(4)
+        msg = WrapLabel("Your generated sample will appear here.")
+        set_role(msg, "notice")
+        hint = WrapLabel("Describe a voice, then choose Generate voice.")
+        set_role(hint, "muted")
+        em.addWidget(msg)
+        em.addWidget(hint)
+        em.addStretch(1)
+        self.vd_preview.insertWidget(PV_EMPTY, empty)
+
+        # busy
+        busy = QtWidgets.QWidget()
+        bl = QtWidgets.QVBoxLayout(busy)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(8)
+        self.lbl_vd_busy = WrapLabel("Preparing…")
+        self.lbl_vd_busy.setAccessibleName("Generation status")
+        bl.addWidget(self.lbl_vd_busy)
+        self.vd_busy_bar = QtWidgets.QProgressBar()
+        self.vd_busy_bar.setRange(0, 0)
+        self.vd_busy_bar.setTextVisible(False)
+        self.vd_busy_bar.setFixedHeight(4)
+        bl.addWidget(self.vd_busy_bar)
+        hint = WrapLabel("The first generation may download the voice model. This is required once.")
+        set_role(hint, "muted")
+        bl.addWidget(hint)
+        bl.addStretch(1)
+        self.vd_preview.insertWidget(PV_BUSY, busy)
+
+        # ready
+        ready = QtWidgets.QWidget()
+        rl = QtWidgets.QVBoxLayout(ready)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(12)
+        self.lbl_vd_notice = WrapLabel("")
+        self.lbl_vd_notice.setAccessibleName("Sample notice")
+        set_role(self.lbl_vd_notice, "notice")
+        self.lbl_vd_notice.setVisible(False)
+        rl.addWidget(self.lbl_vd_notice)
+        player = QtWidgets.QHBoxLayout()
+        player.setSpacing(12)
+        self.btn_vd_play = QtWidgets.QPushButton("Play")
+        self.btn_vd_play.setToolTip("Play the generated sample")
+        self.btn_vd_play.clicked.connect(self.play_sample)
+        player.addWidget(self.btn_vd_play)
+        self.vd_wave = WaveformView()
+        player.addWidget(self.vd_wave, 1)
+        rl.addLayout(player)
+        self.lbl_vd_origin = WrapLabel("")  # which inputs produced this audio
+        self.lbl_vd_origin.setAccessibleName("Sample made from")
+        set_role(self.lbl_vd_origin, "muted")
+        rl.addWidget(self.lbl_vd_origin)
+        self.lbl_vd_stale = WrapLabel(
+            "The description or language has changed since this sample was made. "
+            "Save keeps the original; Generate voice makes a new one.")
+        set_role(self.lbl_vd_stale, "notice")
+        self.lbl_vd_stale.setVisible(False)
+        rl.addWidget(self.lbl_vd_stale)
+        name_lbl = QtWidgets.QLabel("Voice name")
+        set_role(name_lbl, "field")
+        rl.addWidget(name_lbl)
+        save_row = QtWidgets.QHBoxLayout()
+        save_row.setSpacing(8)
+        self.edt_vd_name = QtWidgets.QLineEdit()
+        self.edt_vd_name.setPlaceholderText("Name this voice")
+        self.edt_vd_name.setAccessibleName("Voice name")
+        name_lbl.setBuddy(self.edt_vd_name)
+        self.edt_vd_name.textChanged.connect(lambda _t: self._refresh_save_button())
+        save_row.addWidget(self.edt_vd_name, 1)
+        self.btn_vd_save = QtWidgets.QPushButton("Save")
+        self.btn_vd_save.setEnabled(False)
+        self.btn_vd_save.clicked.connect(self.save_voice)
+        save_row.addWidget(self.btn_vd_save)
+        rl.addLayout(save_row)
+        self.lbl_vd_name_hint = WrapLabel("")
+        set_role(self.lbl_vd_name_hint, "muted")
+        self.lbl_vd_name_hint.setVisible(False)
+        rl.addWidget(self.lbl_vd_name_hint)
+        actions = QtWidgets.QHBoxLayout()
+        actions.setSpacing(8)
+        self.btn_vd_download = QtWidgets.QPushButton("Download")
+        self.btn_vd_download.setToolTip("Export the sample as a WAV file")
+        self.btn_vd_download.clicked.connect(self.download_sample)
+        self.btn_vd_regenerate = QtWidgets.QPushButton("Regenerate")
+        self.btn_vd_regenerate.setToolTip("Generate another sample from the current description")
+        self.btn_vd_regenerate.clicked.connect(self.generate_sample)
+        actions.addWidget(self.btn_vd_download)
+        actions.addWidget(self.btn_vd_regenerate)
+        actions.addStretch(1)
+        rl.addLayout(actions)
+        self.vd_preview.insertWidget(PV_READY, ready)
+
+        # error
+        err = QtWidgets.QWidget()
+        el = QtWidgets.QVBoxLayout(err)
+        el.setContentsMargins(0, 0, 0, 0)
+        el.setSpacing(8)
+        err_title = QtWidgets.QLabel("Couldn't generate the sample")
+        set_role(err_title, "error-title")
+        el.addWidget(err_title)
+        self.lbl_vd_error = WrapLabel("")
+        self.lbl_vd_error.setAccessibleName("Error")
+        el.addWidget(self.lbl_vd_error)
+        self.btn_vd_details = QtWidgets.QPushButton("Show details")
+        self.btn_vd_details.setCheckable(True)
+        set_role(self.btn_vd_details, "quiet")
+        el.addWidget(self.btn_vd_details, 0, QtCore.Qt.AlignLeft)
+        self.lbl_vd_details = WrapLabel("")
+        self.lbl_vd_details.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        set_role(self.lbl_vd_details, "muted")
+        self.lbl_vd_details.setVisible(False)
+        self.btn_vd_details.toggled.connect(self._toggle_error_details)
+        el.addWidget(self.lbl_vd_details)
+        err_row = QtWidgets.QHBoxLayout()
+        err_row.setSpacing(8)
+        self.btn_vd_retry = QtWidgets.QPushButton("Retry")
+        self.btn_vd_retry.clicked.connect(self.generate_sample)
+        self.btn_vd_error_settings = QtWidgets.QPushButton("Open Settings")
+        self.btn_vd_error_settings.clicked.connect(lambda: self.show_page(len(self.nav_buttons) - 1))
+        err_row.addWidget(self.btn_vd_retry)
+        err_row.addWidget(self.btn_vd_error_settings)
+        err_row.addStretch(1)
+        el.addLayout(err_row)
+        el.addStretch(1)
+        self.vd_preview.insertWidget(PV_ERROR, err)
+        return panel
+
+    # ---- bottom strip: model / language / advanced
+    def _build_options_strip(self):
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(32)
+
+        model_box = QtWidgets.QVBoxLayout()
+        model_box.setSpacing(4)
+        cap = QtWidgets.QLabel("Model")
+        set_role(cap, "caption")
+        self.lbl_vd_model = QtWidgets.QLabel(next(n for n, mid in MODELS.items() if mid == MODEL_MAP["voice-design"]))
+        self.lbl_vd_model.setToolTip("Voice creation always uses this model; the clone model is loaded when a voice is saved.")
+        self.lbl_vd_model.setAccessibleName("Model")
+        self.lbl_vd_model.setMinimumHeight(36)  # same height as the language combo beside it
+        model_box.addWidget(cap)
+        model_box.addWidget(self.lbl_vd_model)
+        row.addLayout(model_box)
+
+        lang_box = QtWidgets.QVBoxLayout()
+        lang_box.setSpacing(4)
+        cap2 = QtWidgets.QLabel("Language")
+        set_role(cap2, "caption")
         self.cmb_vd_lang = combo(LANGUAGES, DEFAULT_LANGUAGE)
-        form.addRow("Language:", self.cmb_vd_lang)
+        self.cmb_vd_lang.setMinimumWidth(160)
+        cap2.setBuddy(self.cmb_vd_lang)
+        lang_box.addWidget(cap2)
+        lang_box.addWidget(self.cmb_vd_lang)
+        row.addLayout(lang_box)
+
+        row.addStretch(1)
+        self.btn_vd_advanced = QtWidgets.QPushButton("Advanced settings  ▸")
+        self.btn_vd_advanced.setCheckable(True)
+        self.btn_vd_advanced.setAccessibleName("Advanced settings")
+        set_role(self.btn_vd_advanced, "quiet")
+        self.btn_vd_advanced.toggled.connect(self._toggle_advanced)
+        row.addWidget(self.btn_vd_advanced, 0, QtCore.Qt.AlignBottom)
+        return row
+
+    def _build_advanced_panel(self):
+        panel = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+
+        seed_lay = QtWidgets.QHBoxLayout()
+        seed_lay.setSpacing(8)
+        seed_lbl = QtWidgets.QLabel("Seed")
+        seed_lbl.setMinimumWidth(48)
         self.cmb_vd_seed_mode, self.spn_vd_seed = seed_row("Random", 42)
         self.lbl_vd_seed_used = QtWidgets.QLabel("")
-        seed_lay = QtWidgets.QHBoxLayout()
-        for w in (self.cmb_vd_seed_mode, self.spn_vd_seed, self.lbl_vd_seed_used):
+        seed_lbl.setBuddy(self.cmb_vd_seed_mode)
+        for w in (seed_lbl, self.cmb_vd_seed_mode, self.spn_vd_seed, self.lbl_vd_seed_used):
             seed_lay.addWidget(w)
         seed_lay.addStretch(1)
-        form.addRow("Seed:", seed_lay)
-        lay.addLayout(form)
+        lay.addLayout(seed_lay)
         note = QtWidgets.QLabel(
             "Random tries a new voice each time (the seed used is recorded with the saved voice). "
             "Fixed repeats the same sampling. A saved voice is locked via its reference clip, not the seed.")
         note.setWordWrap(True)
-        note.setStyleSheet("color: gray")
+        set_role(note, "muted")
         lay.addWidget(note)
 
-        # ---- auto-save + random name options
         auto_row = QtWidgets.QHBoxLayout()
+        auto_row.setSpacing(8)
         self.chk_vd_autosave = QtWidgets.QCheckBox("Auto-save generated voices")
         self.chk_vd_autosave.setToolTip("Automatically save each generated sample as a voice.")
+        gender_lbl = QtWidgets.QLabel("Name gender")
         self.cmb_vd_name_gender = QtWidgets.QComboBox()
         self.cmb_vd_name_gender.addItems(["Random", "Male", "Female"])
         self.cmb_vd_name_gender.setToolTip("Gender used for auto-generated voice names.")
-        btn_vd_rand_name = QtWidgets.QPushButton("🎲 Random name")
-        btn_vd_rand_name.clicked.connect(self.fill_random_name)
-        auto_row.addWidget(self.chk_vd_autosave)
-        auto_row.addWidget(QtWidgets.QLabel("Name gender:"))
-        auto_row.addWidget(self.cmb_vd_name_gender)
-        auto_row.addWidget(btn_vd_rand_name)
+        gender_lbl.setBuddy(self.cmb_vd_name_gender)
+        self.btn_vd_rand_name = QtWidgets.QPushButton("Suggest name")
+        self.btn_vd_rand_name.setToolTip("Fill the voice name with a random, unused name")
+        self.btn_vd_rand_name.clicked.connect(self.fill_random_name)
+        for w in (self.chk_vd_autosave, gender_lbl, self.cmb_vd_name_gender, self.btn_vd_rand_name):
+            auto_row.addWidget(w)
         auto_row.addStretch(1)
         lay.addLayout(auto_row)
 
-        self.btn_vd_generate = QtWidgets.QPushButton("Generate sample")
-        self.btn_vd_generate.clicked.connect(self.generate_sample)
-        self.btn_vd_play = QtWidgets.QPushButton("▶ Play sample")
-        self.btn_vd_play.clicked.connect(self.play_sample)
-        self.edt_vd_name = QtWidgets.QLineEdit()
-        self.edt_vd_name.setPlaceholderText("Voice name")
-        self.btn_vd_save = QtWidgets.QPushButton("Save voice")
-        self.btn_vd_save.setEnabled(False)
-        self.btn_vd_save.clicked.connect(self.save_voice)
-        for w in (self.btn_vd_generate, self.btn_vd_play):
-            bar.addWidget(w)
-        bar.addSpacing(20)
-        bar.addWidget(self.edt_vd_name, 1)
-        bar.addWidget(self.btn_vd_save)
-        return page
+        audition_lbl = QtWidgets.QLabel("Audition text (fixed: every voice is auditioned on the same passage)")
+        set_role(audition_lbl, "caption")
+        lay.addWidget(audition_lbl)
+        self.txt_vd_sample = text_edit(3, text=voice_library.SAMPLE_TEXT, read_only=True)
+        self.txt_vd_sample.setAccessibleName("Audition text")
+        self.txt_vd_sample.setTabChangesFocus(True)
+        lay.addWidget(self.txt_vd_sample)
 
+        compute = QtWidgets.QHBoxLayout()
+        self.lbl_vd_compute = QtWidgets.QLabel("")
+        set_role(self.lbl_vd_compute, "muted")
+        self.lbl_vd_compute.setAccessibleName("Current compute settings")
+        self.btn_vd_open_settings = QtWidgets.QPushButton("Open Settings")
+        set_role(self.btn_vd_open_settings, "quiet")
+        self.btn_vd_open_settings.clicked.connect(lambda: self.show_page(len(self.nav_buttons) - 1))
+        compute.addWidget(self.lbl_vd_compute)
+        compute.addWidget(self.btn_vd_open_settings)
+        compute.addStretch(1)
+        lay.addLayout(compute)
+        return panel
+
+    def _toggle_advanced(self, on):
+        self.vd_advanced.setVisible(on)
+        self.btn_vd_advanced.setText("Advanced settings  ▾" if on else "Advanced settings  ▸")
+
+    def _update_compute_summary(self):
+        device, dtype, attn = self.model_settings()
+        self.lbl_vd_compute.setText(f"Device {device} · Dtype {dtype} · Attention {attn}")
+
+    # ---- preview state helpers
+    def _set_preview(self, state):
+        self.vd_preview.setCurrentIndex(state)
+        self.lbl_vd_duration.setVisible(state == PV_READY)
+        self.preview_panel.setProperty("empty", state == PV_EMPTY)  # quiet, unfilled panel until audio exists
+        style = self.preview_panel.style()
+        style.unpolish(self.preview_panel)
+        style.polish(self.preview_panel)
+        self._refresh_stale_note()
+
+    def _relayout_preview(self):
+        # Wrapped labels change height with their text; recompute so nothing is clipped or left oversized.
+        self.vd_preview.updateGeometry()
+        layout = self.preview_panel.layout()
+        layout.invalidate()
+        layout.activate()
+        self.vd_content.layout().invalidate()
+
+    def _vd_notice(self, text):
+        self.lbl_vd_notice.setText(text)
+        self.lbl_vd_notice.setVisible(bool(text))
+        self._relayout_preview()
+
+    def _on_generation_notice(self, message):
+        self.lbl_vd_busy.setText(message)
+        if self.vd_preview.currentIndex() == PV_READY and self.busy:
+            self._vd_notice(f"Generating a new sample: {message}")
+
+    def _toggle_error_details(self, on):
+        self.lbl_vd_details.setVisible(on)
+        self.btn_vd_details.setText("Hide details" if on else "Show details")
+
+    def _show_ready(self, result):
+        wav, sr = np.asarray(result["wav"]), result["sr"]
+        self.vd_wave.set_samples(wav)
+        self.lbl_vd_duration.setText(format_duration(wav.reshape(-1).size / sr))
+        self.lbl_vd_origin.setText(self._origin_text(result))
+        self.lbl_vd_origin.setToolTip(result["description"])
+        self._vd_notice("")
+        self._set_preview(PV_READY)
+
+    def _show_error(self, message):
+        lowered = message.lower()
+        if "flash" in lowered:
+            friendly = "This acceleration option isn't available on this computer."
+            settings_hint = True
+        elif "memory" in lowered:
+            friendly = "This model needs more available memory."
+            settings_hint = False
+        else:
+            friendly = "Something went wrong while creating the sample."
+            settings_hint = False
+        self.btn_vd_error_settings.setVisible(settings_hint)
+        if self.pending_voice:  # keep the last good sample available
+            self._set_preview(PV_READY)
+            self._vd_notice(f"Couldn't generate a new sample. {friendly} Your previous sample is still available.")
+            return
+        self.lbl_vd_error.setText(friendly)
+        self.lbl_vd_details.setText(message)
+        self.btn_vd_details.setChecked(False)
+        self._set_preview(PV_ERROR)
+
+    def _on_description_changed(self):
+        self.lbl_vd_field_error.setVisible(False)
+        self._refresh_stale_note()
+        text = self.txt_vd_instruct.toPlainText()
+        for chip, name, phrase in self.vd_chips:  # keep chips in step with manual edits
+            on = phrase in text
+            if chip.isChecked() != on:
+                chip.blockSignals(True)
+                chip.setChecked(on)
+                chip.blockSignals(False)
+
+    @staticmethod
+    def _origin_text(sample):
+        desc = " ".join(sample["description"].split())
+        if len(desc) > 90:
+            desc = desc[:87].rstrip() + "…"
+        return f"Made from “{desc}” · {sample['language']}"
+
+    def _sample_is_stale(self):
+        """True when the current description or language differ from those that produced the sample."""
+        pending = self.pending_voice
+        return bool(pending) and (
+            self.txt_vd_instruct.toPlainText().strip() != pending["description"]
+            or self.cmb_vd_lang.currentText() != pending["language"])
+
+    def _refresh_stale_note(self):
+        stale = self._sample_is_stale() and self.vd_preview.currentIndex() == PV_READY
+        self.lbl_vd_stale.setVisible(stale)
+        self.lbl_vd_preview_title.setText("Previous sample" if stale else "Preview")
+        self._refresh_save_button()
+        self._relayout_preview()
+
+    def _refresh_save_button(self):
+        """Save needs a sample and a usable name; its label says which inputs it will store."""
+        name = self.edt_vd_name.text().strip()
+        has_sample = bool(self.pending_voice)
+        valid = bool(voice_library.slugify(name))
+        stale = self._sample_is_stale()
+        self.btn_vd_save.setText("Save previous sample" if stale else "Save")
+        if stale:
+            tip = ("Saves this audio with the description and language it was made from "
+                   "(shown above), not your current edits.")
+        else:
+            tip = "Save as a named voice in My Voices"
+        if has_sample and not valid:
+            tip = "Enter a voice name to enable Save."
+        self.btn_vd_save.setToolTip(tip)
+        self.btn_vd_save.setEnabled(has_sample and valid and not self.busy)
+        if not has_sample or valid:
+            hint = ""
+        elif not name:
+            hint = "Enter a voice name to save."
+        else:
+            hint = "Use at least one letter or number in the name."
+        self.lbl_vd_name_hint.setText(hint)
+        self.lbl_vd_name_hint.setVisible(bool(hint))
+        self.edt_vd_name.setAccessibleDescription(hint)
+
+    def _toggle_suggestion(self, phrase, on):
+        text = self.txt_vd_instruct.toPlainText()
+        if on and phrase not in text:
+            new = f"{text.rstrip()} {phrase}" if text.strip() else phrase
+        elif not on and phrase in text:
+            new = " ".join(text.replace(phrase, " ").split())
+        else:
+            return
+        cur = self.txt_vd_instruct.textCursor()  # one undoable edit, so Ctrl+Z restores the old text
+        cur.select(QtGui.QTextCursor.Document)
+        cur.insertText(new)
+        self.txt_vd_instruct.setTextCursor(cur)
+
+    # ---- handlers
     def generate_sample(self):
         description = self.txt_vd_instruct.toPlainText().strip()
         if not description:
             self.status("Error: enter a voice description first.")
+            self.lbl_vd_field_error.setVisible(True)
+            self.txt_vd_instruct.setFocus()
             return
         language = self.cmb_vd_lang.currentText()
         seed = (self.spn_vd_seed.value() if self.cmb_vd_seed_mode.currentText() == "Fixed"
@@ -359,7 +1108,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def done(result):
             self.pending_voice = result
             self.lbl_vd_seed_used.setText(f"Seed used: {result['seed']}")
-            self.btn_vd_save.setEnabled(True)
+            self._show_ready(result)
             self.status("Sample ready. Listen, then name and save the voice if you like it.")
             self.play(result["preview"])
             if self.chk_vd_autosave.isChecked():
@@ -371,13 +1120,39 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.edt_vd_name.setText(name)
                 self.save_voice(autosaved=True)
 
-        self.run_task(work, done)
+        if self.busy:
+            self.status("Busy: a task is already running.")
+            return
+        self.lbl_vd_busy.setText("Preparing…")
+        if self.pending_voice:  # the current sample stays playable until its replacement is ready
+            self._set_preview(PV_READY)
+            self._vd_notice("Generating a new sample. Your current sample stays available.")
+        else:
+            self._set_preview(PV_BUSY)
+        self.run_task(work, done, on_fail=self._show_error, on_notify=self._on_generation_notice, stoppable=False)
 
     def play_sample(self):
         if self.pending_voice:
             self.play(self.pending_voice["preview"])
         else:
             self.status("Generate a sample first.")
+
+    def download_sample(self):
+        pending = self.pending_voice
+        if not pending:
+            self.status("Generate a sample first.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Download sample", "voice-sample.wav", "WAV audio (*.wav)")
+        if not path:
+            return
+        try:
+            write_wav(path, np.asarray(pending["wav"]), pending["sr"])
+        except Exception as e:
+            self._vd_notice(f"Couldn't save the file: {e}")
+            return
+        self._vd_notice(f"Saved a copy to {path}")
+        self.status(f"Sample exported to: {path}")
 
     def save_voice(self, autosaved=False):
         pending = self.pending_voice
@@ -387,7 +1162,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not voice_library.slugify(name):
             self.status("Error: enter a voice name.")
+            self._vd_notice("Enter a voice name to save.")
+            self.edt_vd_name.setFocus()
             return
+        was_stale = self._sample_is_stale()  # the snapshot below keeps the sample's own inputs either way
         overwrite = False
         if voice_library.voice_exists(name):
             if autosaved:
@@ -413,8 +1191,14 @@ class MainWindow(QtWidgets.QMainWindow):
         def done(saved_name):
             self.refresh_voice_lists()
             self.status(f"Voice '{saved_name}' saved to voices/{voice_library.slugify(saved_name)}/")
+            note = f"Saved as '{saved_name}'. Find it in My Voices."
+            if was_stale:
+                note = f"Saved as '{saved_name}' with the description it was made from. Find it in My Voices."
+            self._vd_notice(note)
 
-        self.run_task(work, done)
+        self._vd_notice("")
+        self.run_task(work, done, on_fail=lambda m: self._vd_notice(f"Couldn't save the voice: {m}"),
+                      stoppable=False)
 
     def fill_random_name(self):
         gender = self.cmb_vd_name_gender.currentText().lower()
@@ -435,6 +1219,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------ VoiceClone
     def _build_clone_tab(self):
         page, lay, bar = tab_page(None)
+        lay.addWidget(page_header("Clone Voice"))
 
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Saved voice:"))
@@ -460,7 +1245,7 @@ class MainWindow(QtWidgets.QMainWindow):
             " The Voice Description box is used only when [emotion] tags are present; it is combined with each "
             "tag to form the style instruct. Without tags, the box has no effect.")
         help_lbl.setWordWrap(True)
-        help_lbl.setStyleSheet("color: gray")
+        set_role(help_lbl, "muted")
         lay.addWidget(help_lbl)
 
         form = QtWidgets.QFormLayout()
@@ -510,6 +1295,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(self.grp_ref)
 
         self.btn_vc_generate = QtWidgets.QPushButton("Generate")
+        set_role(self.btn_vc_generate, "primary")
         self.btn_vc_generate.clicked.connect(self.generate_clone)
         bar.addWidget(self.btn_vc_generate)
         bar.addStretch(1)
@@ -593,11 +1379,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cmb_vc_voice.setCurrentText(saved_name)
             self.status(f"Voice '{saved_name}' saved to voices/{voice_library.slugify(saved_name)}/")
 
-        self.run_task(work, done)
+        self.run_task(work, done, stoppable=False)
 
     # ------------------------------------------------------------------ Voices tab
     def _build_voices_tab(self):
         page, lay, bar = tab_page(None)
+        lay.addWidget(page_header("My Voices"))
 
         lay.addWidget(QtWidgets.QLabel("All saved voices (stored in voices/<name>/):"))
         self.tv_voices = QtWidgets.QTableWidget(0, 6)
@@ -611,6 +1398,11 @@ class MainWindow(QtWidgets.QMainWindow):
             hh.setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeToContents)
         self.tv_voices.verticalHeader().hide()
         lay.addWidget(self.tv_voices, 1)
+        self.lbl_voices_empty = QtWidgets.QLabel(
+            "No saved voices yet. Create one in Create Voice, or use Create from audio… below.")
+        self.lbl_voices_empty.setWordWrap(True)
+        set_role(self.lbl_voices_empty, "muted")
+        lay.addWidget(self.lbl_voices_empty)
 
         btn_row = QtWidgets.QHBoxLayout()
         btn_refresh = QtWidgets.QPushButton("Refresh / Detect")
@@ -650,6 +1442,7 @@ class MainWindow(QtWidgets.QMainWindow):
             btn_play.clicked.connect(lambda _=0, slug=d["slug"]: self.play_voice_by_slug(slug))
             self.tv_voices.setCellWidget(r, 5, btn_play)
             self.tv_voices.item(r, 0).setData(QtCore.Qt.UserRole, d["slug"])
+        self.lbl_voices_empty.setVisible(not details)
         self.status(f"{len(details)} voice(s) found.")
 
     def selected_voice_slugs(self):
@@ -785,12 +1578,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.refresh_voice_lists()
             self.status(f"Voice '{saved_name}' created from audio.")
 
-        self.run_task(work, done)
+        self.run_task(work, done, stoppable=False)
 
     @property
     def action_buttons(self):
-        return (self.btn_vd_generate, self.btn_vd_save, self.btn_vc_generate,
-                self.audiobook_tab.btn_render, self.audiobook_tab.btn_preview)
+        return (self.btn_vd_generate, self.btn_vd_save, self.btn_vd_regenerate, self.btn_vd_retry,
+                self.btn_vc_generate, self.audiobook_tab.btn_render, self.audiobook_tab.btn_preview)
 
 
 # ------------------------------------------------------------------ Voice Manager dialog
@@ -891,6 +1684,7 @@ class VoiceManagerDialog(QtWidgets.QDialog):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    apply_theme(app)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
