@@ -88,6 +88,100 @@ Windows: `install.bat` handles installation; use `conda activate qwen3-tts && py
 
 Linux/macOS: `./manage_qwen.sh {install|run|remove|cleanup|purge}`
 
+## Optional XTTS-v2 audiobook voices
+
+XTTS-v2 is an optional audiobook backend; Qwen remains available for voice design,
+cloning, and audiobook rendering. Install the maintained Coqui package in the
+existing `qwen3-tts` environment (review the proposed dependency changes first):
+
+```bash
+conda run -n qwen3-tts python -m pip install --dry-run "coqui-tts>=0.27.4,<0.29"
+conda run -n qwen3-tts python -m pip install "coqui-tts>=0.27.4,<0.29"
+conda run -n qwen3-tts python -m pip check
+```
+
+In the Audiobook tab, select `XTTS: <voice>` for a narrator, dialogue, or individual
+segment. XTTS uses the voice's saved reference WAV; it does not use Qwen's clone
+prompt. Choose an explicit supported language instead of `auto`. Direction and
+emotion tags are not supported for XTTS segments. XTTS uses its own sentence
+splitting, and stop requests take effect between sentences.
+
+The first render downloads the XTTS model and asks you to accept the
+[Coqui Public Model License](https://tts-hub.github.io/cpml) or confirm you have
+a commercial license. XTTS runs in its default precision; the global dtype,
+attention, and word-chunk controls do not apply to XTTS. Mixed-engine chapters
+require matching sample rates.
+
+## Optional CSM-1B audiobook voices
+
+CSM uses the Transformers package already installed by Qwen. Before first use,
+accept the access conditions at [sesame/csm-1b](https://huggingface.co/sesame/csm-1b)
+and log in with a Hugging Face account that has access. On Linux/macOS, from the
+project directory:
+
+```bash
+conda activate qwen3-tts
+export HF_HOME="${HF_HOME:-$PWD/.hf_cache}"
+hf auth login
+```
+
+On Windows Command Prompt, use `set HF_HOME=%CD%\.hf_cache` instead of `export`.
+Enter the token directly into the login prompt; the token is stored under
+`HF_HOME` unless `HF_TOKEN_PATH` is set.
+
+In the Voices tab, select a voice and choose **Reference transcript**. Confirm that the
+text exactly matches the entire reference recording, including for previously
+imported voices. Then select `CSM: <voice>` in the Audiobook tab and choose
+English. CSM uses the saved reference WAV and confirmed transcript, not the Qwen
+clone prompt. Direction and emotion tags are unsupported. CSM splits text into
+short chunks and stops between chunks; a long reference may need to be replaced
+with a shorter recording and matching transcript to fit the context window.
+
+CSM uses the global device and CUDA dtype settings, SDPA attention, and its own
+chunking. CPU inference uses float32. Voice similarity and long-form quality may
+vary, and CSM is not the same fine-tuned model as Sesame's online demo.
+
+## Optional F5-TTS and Dia audiobook voices
+
+Both engines condition each chunk on the saved voice's reference recording and
+matching transcript. This encourages a consistent voice, but does not guarantee
+identical timbre across chunks or engines. Select `F5-TTS: <voice>` or
+`Dia: <voice>` in the Audiobook tab. Neither engine supports the app's direction
+or emotion tags. F5 supports English and Chinese; Dia supports English.
+
+In **Voices**, use **Reference transcript** to confirm the exact words in the
+full reference WAV. Dia uses this reference. For F5, the reference must be at
+most 12 seconds: if the saved recording is longer, use **F5 reference** to
+select a short PCM WAV and enter its exact transcript. F5 uses that separate
+reference when present. Its pretrained weights are licensed under
+[CC BY-NC 4.0](https://huggingface.co/SWivid/F5-TTS), not for commercial use
+without permission.
+
+Dia uses the Transformers package installed with Qwen; it downloads the ungated
+Dia checkpoint and audio codec on first use. Dia outputs 44.1 kHz, converted to
+24 kHz for audiobook mixing. The model authors report around 10 GB VRAM for the
+full model. The device and CUDA dtype settings apply; Dia uses SDPA attention.
+
+Install F5 in a separate environment so its dependencies do not replace Qwen's.
+Choose a suitable PyTorch/torchaudio build for your hardware following the
+[F5-TTS installation guide](https://github.com/SWivid/F5-TTS#installation),
+then install F5 and FFmpeg. For example, on Linux/macOS:
+
+```bash
+conda create -n f5-tts python=3.11
+conda activate f5-tts
+conda install ffmpeg
+python -m pip install "f5-tts==1.1.22"
+export F5_TTS_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+conda activate qwen3-tts
+python launch.py
+```
+
+On Windows, set `F5_TTS_PYTHON` to the F5 environment's Python executable
+before launching the GUI. The helper loads F5 once per render group and exits
+when switching engines. F5 uses its own sampling settings; the GUI temperature
+control does not apply. Both engines stop between chunks.
+
 ## Inference benchmark
 
 List saved voices, then compare one voice, text, and seed across every backend
@@ -119,7 +213,7 @@ once, treat it as a screening run; use repeats for close comparisons.
 
 ## Notes
 
-- Models are downloaded on first use into the project-local `.hf_cache` directory (via `HF_HOME`).
+- Qwen models are downloaded on first use into the project-local `.hf_cache` directory (via `HF_HOME`). Coqui manages its own model cache.
 - Generated audio is written to `output/` and saved voices to `voices/`.
 - At most two models stay in memory at once.
 - The GUI is built with PySide6; all model logic is UI-independent (`tts_generator.py`, `audiobook.py`, `voice_library.py`, `voice_lock.py`, `model_loader.py`).

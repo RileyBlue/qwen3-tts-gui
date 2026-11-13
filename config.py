@@ -24,6 +24,14 @@ MODEL_MAP = {
     "voice-design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     "voice-clone": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
 }
+XTTS_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
+CSM_MODEL = "sesame/csm-1b"
+DIA_MODEL = "nari-labs/Dia-1.6B-0626"
+XTTS_LANGUAGES = {
+    "english": "en", "chinese": "zh-cn", "japanese": "ja", "korean": "ko",
+    "german": "de", "french": "fr", "russian": "ru", "portuguese": "pt",
+    "spanish": "es", "italian": "it",
+}
 
 # Available models for the dropdown (display name -> path)
 MODELS = {

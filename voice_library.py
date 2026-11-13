@@ -11,12 +11,13 @@ import json
 import os
 import re
 import shutil
+import wave
 from datetime import datetime
 import random
 
 import numpy as np
 
-from audio_utils import load_voice_clone_prompt, save_voice_clone_prompt, write_wav
+from audio_utils import load_voice_clone_prompt, save_voice_clone_prompt, write_wav, load_wav
 
 VOICES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
 
@@ -110,6 +111,36 @@ def load_voice(name, root=None):
         config = json.load(f)
     prompt = load_voice_clone_prompt(os.path.join(path, config["clone_prompt"]))
     return config, prompt, path
+
+
+def set_csm_reference_text(name, text, root=None):
+    path = os.path.join(voice_dir(name, root), "voice.json")
+    with open(path, encoding="utf-8") as voice_file:
+        config = json.load(voice_file)
+    config["csm_ref_text"] = text.strip()
+    with open(path, "w", encoding="utf-8") as voice_file:
+        json.dump(config, voice_file, indent=2, ensure_ascii=False)
+
+
+def set_f5_reference(name, source_path, text, root=None):
+    text = text.strip()
+    if not text:
+        raise ValueError("Enter the transcript for the F5 reference recording.")
+    try:
+        wav, sample_rate = load_wav(source_path)
+    except (wave.Error, EOFError) as exc:
+        raise ValueError("F5 reference must be a valid PCM WAV file.") from exc
+    if not len(wav) or len(wav) / sample_rate > 12:
+        raise ValueError("F5 reference audio must be nonempty and no longer than 12 seconds.")
+    path = voice_dir(name, root)
+    config_path = os.path.join(path, "voice.json")
+    with open(config_path, encoding="utf-8") as voice_file:
+        config = json.load(voice_file)
+    write_wav(os.path.join(path, "f5_reference.wav"), wav, sample_rate)
+    config["f5_ref_audio"] = "f5_reference.wav"
+    config["f5_ref_text"] = text
+    with open(config_path, "w", encoding="utf-8") as voice_file:
+        json.dump(config, voice_file, indent=2, ensure_ascii=False)
 
 
 def delete_voice(name, root=None):

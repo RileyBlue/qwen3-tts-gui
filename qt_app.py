@@ -1420,7 +1420,12 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_delete.clicked.connect(self.delete_voice_tab)
         btn_play = QtWidgets.QPushButton("▶ Play reference")
         btn_play.clicked.connect(self.play_voice_tab)
-        for b in (btn_refresh, btn_import, btn_create, btn_rename, btn_delete, btn_play):
+        btn_transcript = QtWidgets.QPushButton("Reference transcript…")
+        btn_transcript.clicked.connect(self.edit_csm_transcript)
+        btn_f5_reference = QtWidgets.QPushButton("F5 reference…")
+        btn_f5_reference.clicked.connect(self.edit_f5_reference)
+        for b in (btn_refresh, btn_import, btn_create, btn_rename, btn_delete, btn_play,
+              btn_transcript, btn_f5_reference):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         lay.addLayout(btn_row)
@@ -1493,6 +1498,43 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status("Error: select exactly one voice to play.")
             return
         self.play_voice_by_slug(slug)
+
+    def edit_csm_transcript(self):
+        slug = self.selected_voice_slug()
+        if slug is None:
+            self.status("Error: select exactly one voice.")
+            return
+        try:
+            with open(os.path.join(voice_library.voice_dir(slug), "voice.json"), encoding="utf-8") as voice_file:
+                config = json.load(voice_file)
+            text, accepted = QtWidgets.QInputDialog.getMultiLineText(
+                self, "Reference transcript",
+                "Enter the exact words spoken in the entire reference recording:",
+                config.get("csm_ref_text", config.get("ref_text", "")))
+            if accepted:
+                voice_library.set_csm_reference_text(slug, text)
+                self.status(f"Reference transcript saved for '{slug}'.")
+        except (OSError, ValueError) as exc:
+            self.status(f"Error saving reference transcript: {exc}")
+
+    def edit_f5_reference(self):
+        slug = self.selected_voice_slug()
+        if slug is None:
+            self.status("Error: select exactly one voice.")
+            return
+        source, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select F5 reference (12 seconds or less)", "", "WAV audio (*.wav)")
+        if not source:
+            return
+        text, accepted = QtWidgets.QInputDialog.getMultiLineText(
+            self, "F5 reference transcript", "Enter the exact words spoken in this recording:")
+        if not accepted:
+            return
+        try:
+            voice_library.set_f5_reference(slug, source, text)
+            self.status(f"F5 reference saved for '{slug}'.")
+        except (OSError, ValueError) as exc:
+            self.status(f"Error saving F5 reference: {exc}")
 
     def play_voice_by_slug(self, slug):
         path = os.path.join(voice_library.voice_dir(slug), "reference.wav")

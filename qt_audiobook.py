@@ -154,8 +154,12 @@ class AudiobookTab(QtWidgets.QWidget):
             idx = cmb.findData(current)
             if idx >= 0:
                 cmb.setCurrentIndex(idx)
-        if self.cmb_dialogue.count() > 1 and self.cmb_dialogue.currentIndex() == self.cmb_narrator.currentIndex():
-            self.cmb_dialogue.setCurrentIndex(1)
+        if self.cmb_dialogue.currentData() == self.cmb_narrator.currentData():
+            for index in range(self.cmb_dialogue.count()):
+                key = self.cmb_dialogue.itemData(index)
+                if key.startswith("voice:") and key != self.cmb_narrator.currentData():
+                    self.cmb_dialogue.setCurrentIndex(index)
+                    break
         self._loading = True
         for r in range(self.table.rowCount()):
             self._fill_voice_combo(self.table.cellWidget(r, COL_VOICE), self.segments[r]["voice"])
@@ -331,6 +335,26 @@ class AudiobookTab(QtWidgets.QWidget):
             if not s["voice"]:
                 self.win.status("Error: every segment needs a voice.")
                 return False
+        if any(s["voice"].startswith("xtts:") for s in segs) and os.environ.get("COQUI_TOS_AGREED") != "1":
+            answer = QtWidgets.QMessageBox.question(
+                self, "XTTS model license",
+                "XTTS-v2 is subject to the Coqui Public Model License. "
+                "Review https://tts-hub.github.io/cpml before continuing.\n\n"
+                "Do you have a commercial license or agree to the non-commercial license?")
+            if answer != QtWidgets.QMessageBox.Yes:
+                self.win.status("XTTS license acceptance is required.")
+                return False
+            os.environ["COQUI_TOS_AGREED"] = "1"
+        if any(s["voice"].startswith("f5:") for s in segs) and os.environ.get("F5_TTS_LICENSE_CONFIRMED") != "1":
+            answer = QtWidgets.QMessageBox.question(
+                self, "F5-TTS model license",
+                "The pretrained F5-TTS weights use the CC BY-NC 4.0 license. "
+                "Review https://creativecommons.org/licenses/by-nc/4.0/ before continuing.\n\n"
+                "Do you have permission to use these weights for your intended purpose?")
+            if answer != QtWidgets.QMessageBox.Yes:
+                self.win.status("F5-TTS license confirmation is required.")
+                return False
+            os.environ["F5_TTS_LICENSE_CONFIRMED"] = "1"
         return True
 
     def preview_segment(self):
@@ -347,6 +371,9 @@ class AudiobookTab(QtWidgets.QWidget):
 
         def done(result):
             wav, sr = result
+            if wav is None:
+                self.win.status("Stopped before the segment was finished.")
+                return
             path = os.path.join(OUTPUT_DIR, "_segment_preview.wav")
             write_wav(path, wav, sr)
             self.win.status(f"Previewing segment {r + 1}.")
