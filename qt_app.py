@@ -93,6 +93,7 @@ def text_edit(height_lines, placeholder="", text="", read_only=False):
     """QPlainTextEdit gives native undo/redo (Ctrl+Z, Ctrl+Y/Ctrl+Shift+Z) and Ctrl+A."""
     w = QtWidgets.QPlainTextEdit()
     w.setUndoRedoEnabled(True)
+    w.setTabChangesFocus(True)  # Tab moves on instead of inserting a tab character (keyboard trap)
     w.setPlaceholderText(placeholder)
     w.setReadOnly(read_only)
     if text:
@@ -1420,16 +1421,34 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_delete.clicked.connect(self.delete_voice_tab)
         btn_play = QtWidgets.QPushButton("▶ Play reference")
         btn_play.clicked.connect(self.play_voice_tab)
-        btn_transcript = QtWidgets.QPushButton("Reference transcript…")
-        btn_transcript.clicked.connect(self.edit_csm_transcript)
-        btn_f5_reference = QtWidgets.QPushButton("F5 reference…")
-        btn_f5_reference.clicked.connect(self.edit_f5_reference)
-        for b in (btn_refresh, btn_import, btn_create, btn_rename, btn_delete, btn_play,
-              btn_transcript, btn_f5_reference):
+        btn_transcript = QtGui.QAction("Reference transcript…", self)
+        btn_transcript.triggered.connect(self.edit_csm_transcript)
+        btn_f5_reference = QtGui.QAction("F5 reference…", self)
+        btn_f5_reference.triggered.connect(self.edit_f5_reference)
+        # Engine-specific references are rare and need exactly one voice, so they live in a menu.
+        self.btn_voice_engine_refs = QtWidgets.QPushButton("Engine references")
+        set_role(self.btn_voice_engine_refs, "menu")
+        engine_menu = QtWidgets.QMenu(self.btn_voice_engine_refs)
+        engine_menu.addAction(btn_transcript)
+        engine_menu.addAction(btn_f5_reference)
+        self.btn_voice_engine_refs.setMenu(engine_menu)
+        self.act_voice_transcript, self.act_voice_f5 = btn_transcript, btn_f5_reference
+
+        # Two rows so nothing clips at 1024 px: the library, then the selected voice.
+        for b in (btn_import, btn_create, btn_refresh):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         lay.addLayout(btn_row)
+        sel_row = QtWidgets.QHBoxLayout()
+        lbl_selected = QtWidgets.QLabel("Selected voice:")
+        set_role(lbl_selected, "muted")
+        sel_row.addWidget(lbl_selected)
+        for b in (btn_play, btn_rename, btn_delete, self.btn_voice_engine_refs):
+            sel_row.addWidget(b)
+        sel_row.addStretch(1)
+        lay.addLayout(sel_row)
 
+        self.tv_voices.itemSelectionChanged.connect(self._refresh_voice_actions)
         self.refresh_voices_tab()
         return page
 
@@ -1448,7 +1467,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tv_voices.setCellWidget(r, 5, btn_play)
             self.tv_voices.item(r, 0).setData(QtCore.Qt.UserRole, d["slug"])
         self.lbl_voices_empty.setVisible(not details)
+        self._refresh_voice_actions()
         self.status(f"{len(details)} voice(s) found.")
+
+    def _refresh_voice_actions(self):
+        """Engine references need exactly one saved voice; handlers keep their own error fallback."""
+        one = self.selected_voice_slug() is not None
+        self.btn_voice_engine_refs.setEnabled(one)
+        self.btn_voice_engine_refs.setToolTip(
+            "Add a reference transcript or F5 reference for the selected voice."
+            if one else "Select exactly one voice to add an engine reference.")
 
     def selected_voice_slugs(self):
         slugs = []
@@ -1724,8 +1752,19 @@ class VoiceManagerDialog(QtWidgets.QDialog):
             self.parent().refresh_voice_lists()
 
 
+def configure_keyboard_navigation(app):
+    """Let Tab reach every control on every platform.
+
+    macOS only Tab-focuses text and list controls unless the system's Full Keyboard Access is on.
+    Then the description box is the only Tab stop, Qt finds nowhere to move and inserts a tab
+    character instead (a keyboard trap). The app promises full keyboard operation, so it opts in.
+    """
+    app.styleHints().setTabFocusBehavior(QtCore.Qt.TabFocusAllControls)
+
+
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    configure_keyboard_navigation(app)
     apply_theme(app)
     win = MainWindow()
     win.show()

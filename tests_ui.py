@@ -14,14 +14,15 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtTest import QTest
 
 import audio_player
 import qt_app
 import theme
 import voice_library
-from qt_app import CONTENT_MAX_WIDTH, MainWindow, PV_BUSY, PV_EMPTY, PV_ERROR, PV_READY
+PAGE_VOICES = 2
+from qt_app import CONTENT_MAX_WIDTH, MainWindow, configure_keyboard_navigation, PV_BUSY, PV_EMPTY, PV_ERROR, PV_READY
 
 
 class _StubModels:
@@ -67,6 +68,7 @@ _app = None
 def _make_window(themed=True, models=None):
     global _app
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    configure_keyboard_navigation(_app)
     if themed:
         theme.apply_theme(_app)
     stub = models or _StubModels()
@@ -341,6 +343,223 @@ def _test_my_voices_empty_state():
     finally:
         voice_library.VOICES_DIR = original
     print("PASS: My Voices shows an empty-state hint only when there are no voices")
+
+
+def _with_voices(names):
+    """Temporary voice library; returns (restore, root)."""
+    original = voice_library.VOICES_DIR
+    root = voice_library.VOICES_DIR = tempfile.mkdtemp()
+    for name in names:
+        os.makedirs(os.path.join(root, name))
+        with open(os.path.join(root, name, "voice.json"), "w") as f:
+            f.write('{"name": "%s", "description": "A warm narrator voice", "language": "english", '
+                    '"seed": 1, "created": "2026-11-12 10:00"}' % name)
+
+    def restore():
+        voice_library.VOICES_DIR = original
+    return restore
+
+
+def _test_my_voices_actions_fit_at_1024_px():
+    for names in ([], ["Ada", "Brook", "Cleo"]):
+        restore = _with_voices(names)
+        try:
+            win, _ = _make_window()
+            win.resize(1024, 640)
+            win.show_page(PAGE_VOICES)
+            _shown(win)
+            page = win.stack.currentWidget()
+            area = page.findChild(QtWidgets.QScrollArea)
+            assert area.horizontalScrollBar().maximum() == 0, "My Voices must not scroll sideways at 1024 px"
+            viewport = area.viewport().rect()
+            for button in page.findChildren(QtWidgets.QPushButton):
+                if button.text() == "▶":
+                    continue
+                top_left = button.mapTo(area.viewport(), QtCore.QPoint(0, 0))
+                assert viewport.contains(QtCore.QRect(top_left, button.size())), f"{button.text()!r} is clipped"
+                need = button.fontMetrics().horizontalAdvance(button.text()) + 24
+                assert button.width() >= need, f"{button.text()!r} is squeezed"
+            win.close()
+        finally:
+            restore()
+    print("PASS: every My Voices action is visible at 1024 px, with and without voices")
+
+
+def _test_engine_references_require_exactly_one_voice():
+    restore = _with_voices(["Ada", "Brook"])
+    try:
+        win, _ = _make_window()
+        win.resize(1024, 640)
+        win.show_page(PAGE_VOICES)
+        _shown(win)
+        button = win.btn_voice_engine_refs
+        assert not button.isEnabled() and "exactly one" in button.toolTip()
+        win.tv_voices.selectRow(0)
+        assert button.isEnabled()
+        win.tv_voices.selectAll()
+        assert not button.isEnabled(), "two selected voices must disable the engine references"
+        win.tv_voices.clearSelection()
+        assert not button.isEnabled()
+        # The old handlers keep their own error fallback when called without a selection.
+        win.edit_csm_transcript()
+        assert "select exactly one voice" in win.lbl_status.text().lower()
+        win.edit_f5_reference()
+        assert "select exactly one voice" in win.lbl_status.text().lower()
+        # Both existing actions are still offered, under their original names.
+        labels = [a.text() for a in button.menu().actions()]
+        assert labels == ["Reference transcript…", "F5 reference…"], labels
+        win.close()
+    finally:
+        restore()
+    print("PASS: engine references are disabled unless exactly one voice is selected; handlers keep their fallback")
+
+
+def _test_engine_references_menu_works_from_the_keyboard():
+    restore = _with_voices(["Ada"])
+    try:
+        win, _ = _make_window()
+        win.resize(1024, 640)
+        win.show_page(PAGE_VOICES)
+        _shown(win)
+        win.tv_voices.selectRow(0)
+        calls = []
+        win.act_voice_transcript.triggered.disconnect()
+        win.act_voice_f5.triggered.disconnect()
+        win.act_voice_transcript.triggered.connect(lambda: calls.append("transcript"))
+        win.act_voice_f5.triggered.connect(lambda: calls.append("f5"))
+        button = win.btn_voice_engine_refs
+        button.setFocus()
+        _app.processEvents()
+        assert win.focusWidget() is button
+        QTest.keyClick(button, QtCore.Qt.Key_Space)
+        _app.processEvents()
+        menu = button.menu()
+        assert menu.isVisible(), "Space must open the menu"
+        QTest.keyClick(menu, QtCore.Qt.Key_Down)
+        QTest.keyClick(menu, QtCore.Qt.Key_Down)
+        QTest.keyClick(menu, QtCore.Qt.Key_Return)
+        _app.processEvents()
+        assert calls == ["f5"], calls
+        QTest.keyClick(button, QtCore.Qt.Key_Space)
+        _app.processEvents()
+        assert menu.isVisible()
+        QTest.keyClick(menu, QtCore.Qt.Key_Escape)
+        _app.processEvents()
+        assert not menu.isVisible() and win.focusWidget() is button, "Escape closes the menu and keeps focus"
+        win.close()
+    finally:
+        restore()
+    print("PASS: the engine references menu opens, navigates, selects and closes with the keyboard")
+
+
+def _test_my_voices_tab_order():
+    restore = _with_voices(["Ada"])
+    try:
+        win, _ = _make_window()
+        win.resize(1024, 640)
+        win.show_page(PAGE_VOICES)
+        _shown(win)
+        win.tv_voices.selectRow(0)
+        page = win.stack.currentWidget()
+        first = next(b for b in page.findChildren(QtWidgets.QPushButton) if b.text() == "Import voice…")
+        first.setFocus()
+        _app.processEvents()
+        seen = [first.text()]
+        for _ in range(7):
+            QTest.keyClick(win.focusWidget(), QtCore.Qt.Key_Tab)
+            _app.processEvents()
+            seen.append(getattr(win.focusWidget(), "text", lambda: "?")())
+        expected = ["Import voice…", "Create from audio…", "Refresh / Detect", "▶ Play reference",
+                    "Rename selected", "Delete selected", "Engine references"]
+        assert seen[:7] == expected, seen
+        win.close()
+    finally:
+        restore()
+    print("PASS: My Voices Tab order is library actions, then selected-voice actions")
+
+
+def _test_multiline_editors_never_trap_the_keyboard():
+    win, _ = _make_window()
+    win.resize(1024, 640)
+    tab = win.audiobook_tab
+    editors = {"audiobook chapter": tab.txt_source, "audiobook segment": tab.txt_segment,
+               "clone text": win.txt_vc_text, "clone instruction": win.txt_vc_instruct}
+    for name, editor in editors.items():
+        assert editor.tabChangesFocus(), f"{name} traps Tab"
+    win.show_page(3)
+    _shown(win)
+    tab.txt_source.setFocus()
+    _app.processEvents()
+    QTest.keyClicks(tab.txt_source, "one")
+    QTest.keyClick(tab.txt_source, QtCore.Qt.Key_Return)
+    QTest.keyClicks(tab.txt_source, "two")
+    assert tab.txt_source.toPlainText() == "one\ntwo", "multiline entry must still work"
+    QTest.keyClick(tab.txt_source, QtCore.Qt.Key_Tab)
+    _app.processEvents()
+    assert win.focusWidget() is not tab.txt_source and "\t" not in tab.txt_source.toPlainText()
+    win.close()
+    print("PASS: Audiobook and Clone text boxes release Tab and still accept multiline text")
+
+
+def _test_tab_leaves_description_under_the_macos_default_tab_behavior():
+    """Offscreen Qt tabs through every control, real macOS does not unless Full Keyboard Access is on.
+
+    On macOS only text/list controls are Tab stops by default, so the description was the only one
+    and Tab inserted a tab character. Emulate that default and drive real window-level key events.
+    """
+    macos_default = QtCore.Qt.TabFocusBehavior(3)  # text + list controls, as on a stock Mac
+    _make_window()
+    hints = _app.styleHints()
+    original = hints.tabFocusBehavior()
+    try:
+        def key(win, k, mod=QtCore.Qt.NoModifier):
+            QTest.keyClick(win.windowHandle(), k, mod)
+            _app.processEvents()
+
+        # Without the app's setting the trap reproduces (this documents why offscreen missed it).
+        hints.setTabFocusBehavior(macos_default)
+        win, _ = _make_window()
+        hints.setTabFocusBehavior(macos_default)
+        win.resize(1024, 640)
+        _shown(win)
+        win.txt_vd_instruct.setFocus()
+        _app.processEvents()
+        key(win, QtCore.Qt.Key_Tab)
+        assert win.focusWidget() is win.txt_vd_instruct and "\t" in win.txt_vd_instruct.toPlainText(), \
+            "expected the macOS default to trap Tab; the emulation is not faithful"
+        win.close()
+
+        # With the app's startup configuration (what main() does) the full sequence works.
+        for text in ("", "line one\nline two"):
+            hints.setTabFocusBehavior(macos_default)
+            configure_keyboard_navigation(_app)
+            win, _ = _make_window()
+            win.resize(1024, 640)
+            _shown(win)
+            win.nav_buttons[0].setFocus()
+            _app.processEvents()
+            key(win, QtCore.Qt.Key_Tab)                       # navigation -> Voice description
+            assert win.focusWidget() is win.txt_vd_instruct, _focus_label(win.focusWidget())
+            win.txt_vd_instruct.setPlainText(text)
+            before = win.txt_vd_instruct.toPlainText()
+            key(win, QtCore.Qt.Key_Tab)                       # description -> next control
+            assert win.focusWidget() is not win.txt_vd_instruct, "Tab is trapped in the description"
+            assert win.focusWidget() is win.vd_chips[0][0], _focus_label(win.focusWidget())
+            assert win.txt_vd_instruct.toPlainText() == before, "Tab must not modify the description"
+            key(win, QtCore.Qt.Key_Backtab, QtCore.Qt.ShiftModifier)   # Shift+Tab goes back
+            assert win.focusWidget() is win.txt_vd_instruct
+            assert win.txt_vd_instruct.toPlainText() == before
+            key(win, QtCore.Qt.Key_Tab, QtCore.Qt.ShiftModifier)       # Shift+Tab as Tab+Shift
+            assert win.focusWidget() is win.nav_buttons[0], _focus_label(win.focusWidget())
+            win.txt_vd_instruct.setFocus()
+            win.txt_vd_instruct.moveCursor(QtGui.QTextCursor.End)
+            _app.processEvents()
+            key(win, QtCore.Qt.Key_Return)                    # Enter still adds a line
+            assert win.txt_vd_instruct.toPlainText() == before + "\n" and win.focusWidget() is win.txt_vd_instruct
+            win.close()
+    finally:
+        hints.setTabFocusBehavior(original)
+    print("PASS: Tab/Shift+Tab leave the description under the macOS default tab behavior; Enter adds a line")
 
 
 def _test_create_voice_layout_at_minimum_and_wide_sizes():
@@ -736,6 +955,12 @@ def run_ui_tests():
     _test_footer_actions_match_what_they_can_do()
     _test_settings_page_separates_scopes()
     _test_my_voices_empty_state()
+    _test_my_voices_actions_fit_at_1024_px()
+    _test_engine_references_require_exactly_one_voice()
+    _test_engine_references_menu_works_from_the_keyboard()
+    _test_my_voices_tab_order()
+    _test_multiline_editors_never_trap_the_keyboard()
+    _test_tab_leaves_description_under_the_macos_default_tab_behavior()
     _test_create_voice_layout_at_minimum_and_wide_sizes()
     _test_busy_toggles_action_buttons()
     _test_single_primary_button_and_neutral_nav()

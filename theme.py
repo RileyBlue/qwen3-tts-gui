@@ -75,7 +75,9 @@ def build_qss(c=COLORS, arrow=None):
     s = RADII["surface"]
     # Flatten the native drop-down only when our chevron exists; otherwise keep the native one.
     arrow_rule = (f'QComboBox::drop-down {{ border: none; background: transparent; width: 28px; }}\n'
-                  f'QComboBox::down-arrow {{ image: url("{arrow}"); width: 12px; height: 12px; }}'
+                  f'QComboBox::down-arrow {{ image: url("{arrow}"); width: 12px; height: 12px; }}\n'
+                  f'QPushButton[role="menu"]::menu-indicator {{ image: url("{arrow}"); width: 12px; height: 12px;'
+                  f' subcontrol-origin: padding; subcontrol-position: right center; right: 10px; }}'
                   if arrow else "")
     f = FONT_PX
     return f"""
@@ -91,6 +93,12 @@ QPushButton:hover {{ background: {c['surface_hover']}; }}
 QPushButton:pressed {{ background: {c['canvas']}; }}
 QPushButton:focus {{ border: 2px solid {c['accent']}; padding: 6px 13px; }}
 QPushButton:disabled {{ color: {c['text_disabled']}; background: {c['sidebar']}; border-color: {c['border']}; }}
+QPushButton[role="menu"] {{ padding-right: 38px; }}
+QPushButton[role="menu"]:focus {{ padding-right: 37px; }}
+QMenu {{ background: {c['surface']}; color: {c['text']}; border: 1px solid {c['border_control']}; padding: 4px; }}
+QMenu::item {{ padding: 7px 18px; border-radius: 4px; }}
+QMenu::item:selected {{ background: {c['nav_selected']}; color: {c['text']}; }}
+QMenu::item:disabled {{ color: {c['text_disabled']}; }}
 
 QPushButton[role="primary"] {{
     background: {c['accent']}; color: {c['on_accent']}; border: 1px solid {c['accent']};
@@ -183,6 +191,8 @@ QHeaderView::section {{
 /* ---- compact density: pages that keep their original dense layout (Clone, My Voices, Audiobooks) */
 QWidget[density="compact"] QPushButton {{ padding: 4px 12px; }}
 QWidget[density="compact"] QPushButton:focus {{ padding: 3px 11px; }}
+QWidget[density="compact"] QPushButton[role="menu"] {{ padding-right: 38px; }}
+QWidget[density="compact"] QPushButton[role="menu"]:focus {{ padding-right: 37px; }}
 QWidget[density="compact"] QPushButton[role="primary"] {{ padding: 8px 20px; }}
 QWidget[density="compact"] QPushButton[role="primary"]:focus {{ padding: 7px 19px; }}
 QWidget[density="compact"] QTableWidget QPushButton {{ padding: 0 4px; min-height: 0; }}
