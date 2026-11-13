@@ -22,8 +22,12 @@ def saved_key(name):
 
 def voice_choices():
     """[(label, key)] for every selectable voice: saved voices."""
-    items = [(f"Saved: {n}", saved_key(n)) for n in voice_library.list_voices()]
-    return items
+    names = voice_library.list_voices()
+    return ([(f"Qwen: {name}", saved_key(name)) for name in names] +
+            [(f"XTTS: {name}", f"xtts:{name}") for name in names] +
+            [(f"CSM: {name}", f"csm:{name}") for name in names] +
+            [(f"F5-TTS: {name}", f"f5:{name}") for name in names] +
+            [(f"Dia: {name}", f"dia:{name}") for name in names])
 
 
 def new_segment(text, voice, kind="narration", direction=""):
@@ -70,12 +74,22 @@ def apply_direction(segment):
 
 
 def _voice_fingerprint(voice_key):
-    if voice_key.startswith("voice:"):
-        name = voice_key[len("voice:"):]
+    if voice_key.startswith(("voice:", "xtts:", "csm:", "f5:", "dia:")):
+        name = voice_key.split(":", 1)[1]
         try:
             with open(os.path.join(voice_library.voice_dir(name), "voice.json"), encoding="utf-8") as f:
                 cfg = json.load(f)
-            return [cfg.get("created"), cfg.get("seed"), cfg.get("description")]
+            fingerprint = [cfg.get("created"), cfg.get("seed"), cfg.get("description")]
+            if voice_key.startswith(("xtts:", "csm:", "f5:", "dia:")):
+                ref_file_name = cfg.get("f5_ref_audio") if voice_key.startswith("f5:") else None
+                ref_path = os.path.join(voice_library.voice_dir(name), ref_file_name or cfg.get("ref_audio", "reference.wav"))
+                with open(ref_path, "rb") as ref_file:
+                    fingerprint.append(hashlib.sha256(ref_file.read()).hexdigest())
+            if voice_key.startswith(("csm:", "dia:")):
+                fingerprint.append(cfg.get("csm_ref_text"))
+            elif voice_key.startswith("f5:"):
+                fingerprint.append(cfg.get("f5_ref_text") if cfg.get("f5_ref_audio") else cfg.get("csm_ref_text"))
+            return fingerprint
         except OSError:
             return None
     return None
@@ -108,6 +122,25 @@ def render_segment(gen, segment, settings, cache_dir=SEGMENT_CACHE_DIR):
             text=text, language=settings["language"], min_words=settings["min_words"],
             max_words=settings["max_words"], seed=settings["seed"],
             temperature=settings["temperature"], voice_name=voice[len("voice:"):])
+    elif voice.startswith("xtts:"):
+        if segment.get("direction", "").strip():
+            raise ValueError("XTTS does not support direction tags. Remove the segment direction.")
+        wavs, sr = gen.xtts(
+            text=text, language=settings["language"], seed=settings["seed"],
+            temperature=settings["temperature"], voice_name=voice[len("xtts:"):])
+    elif voice.startswith("csm:"):
+        if segment.get("direction", "").strip():
+            raise ValueError("CSM does not support direction tags. Remove the segment direction.")
+        wavs, sr = gen.csm(
+            text=text, language=settings["language"], seed=settings["seed"],
+            temperature=settings["temperature"], voice_name=voice[len("csm:"):])
+    elif voice.startswith(("f5:", "dia:")):
+        engine, name = voice.split(":", 1)
+        if (segment.get("direction") or "").strip():
+            raise ValueError(f"{engine.upper()} does not support direction tags. Remove the segment direction.")
+        wavs, sr = getattr(gen, engine)(
+            text=text, language=settings["language"], seed=settings["seed"],
+            temperature=settings["temperature"], voice_name=name)
     else:
         raise ValueError(f"Segment has no voice assigned: {segment['text'][:40]!r}")
     if not wavs:
@@ -124,7 +157,7 @@ def render_chapter(gen, segments, settings, should_stop=lambda: False, notify=pr
     Returns [(wav, sr)] in segment order, or None if stopped.
     """
     order = sorted(range(len(segments)),
-                   key=lambda i: (segments[i]["voice"].startswith("voice:"), i))
+                   key=lambda i: (segments[i]["voice"].split(":", 1)[0], i))
     results = [None] * len(segments)
     for n, i in enumerate(order):
         if should_stop():
