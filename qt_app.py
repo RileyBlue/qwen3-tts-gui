@@ -17,6 +17,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import audio_player
+import icons
 import voice_library
 from audio_utils import save_outputs, write_wav, load_wav
 from config import (
@@ -49,7 +50,14 @@ SUGGESTIONS = (
 CONTENT_MAX_WIDTH = 1120
 
 # Starts a Create Voice generation. Qt maps Ctrl to Command on macOS, so show the native spelling.
+# Lucide icon for each sidebar entry; the text label always stays next to it.
+NAV_ICONS = {"Create Voice": "wand-sparkles", "Clone Voice": "copy", "My Voices": "mic-vocal",
+             "Audiobooks": "book-open", "Settings": "settings"}
 GENERATE_SHORTCUT = "Ctrl+Return"
+READY_STATUS = "Sample ready. Listen, then name and save the voice if you like it."
+STOP_AUDIO_TIP = "Stop the audio that is playing"
+STOP_AUDIO_IDLE_TIP = "No audio is playing"
+STALE_STATUS = "Showing the previous sample. Generate voice to hear your changes."
 
 
 def shortcut_text(sequence=GENERATE_SHORTCUT):
@@ -243,7 +251,7 @@ class WaveformView(QtWidgets.QWidget):
             return
         painter = QtGui.QPainter(self)
         painter.setPen(QtCore.Qt.NoPen)
-        painter.setBrush(QtGui.QColor(COLORS["text_secondary"]))
+        painter.setBrush(QtGui.QColor(COLORS["text_muted"]))
         step = self.width() / len(self._peaks)
         bar = max(2.0, step - 3)
         mid = self.height() / 2
@@ -368,6 +376,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def add_nav(label):
             btn = QtWidgets.QPushButton(label)
             btn.setCheckable(True)
+            icons.apply(btn, NAV_ICONS.get(label, ""), icons.SIZE_NAV, "nav")
             btn.setToolTip(f"{label} (Ctrl+{len(self.nav_buttons) + 1})")
             set_role(btn, "nav")
             self.nav_group.addButton(btn, len(self.nav_buttons))
@@ -491,6 +500,12 @@ class MainWindow(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         row.setContentsMargins(24, 8, 24, 8)
         row.setSpacing(8)
+        # Decorative glyph for the two states that benefit from one; the status text always says it too.
+        self.lbl_status_icon = QtWidgets.QLabel()
+        self.lbl_status_icon.setFixedSize(icons.SIZE_COMPACT, icons.SIZE_COMPACT)
+        self.lbl_status_icon.setVisible(False)
+        row.addWidget(self.lbl_status_icon)
+        row.setSpacing(8)
         self.lbl_status = QtWidgets.QLabel("Ready")
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setAccessibleName("Status")
@@ -499,30 +514,66 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_play_last.setEnabled(False)
         self.btn_play_last.clicked.connect(lambda: self.play(self.last_output))
         self.btn_stop_audio = QtWidgets.QPushButton("Stop audio")
-        self.btn_stop_audio.clicked.connect(audio_player.stop)
+        self.btn_stop_audio.clicked.connect(self.stop_audio)
         self.btn_open_out = QtWidgets.QPushButton("Open output folder")
-        self.btn_open_out.clicked.connect(
-            lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(OUTPUT_DIR)))
+        self.btn_open_out.clicked.connect(self.open_output_folder)
         self.btn_stop = QtWidgets.QPushButton("Stop generation")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.request_stop)
         self.btn_play_last.setToolTip("Play the most recent Clone Voice or Audiobook render")
-        self.btn_stop_audio.setToolTip("Stop any audio that is playing")
+        self.btn_stop_audio.setToolTip(STOP_AUDIO_TIP)
         self.btn_open_out.setToolTip("Open the folder where renders are saved")
         self.btn_stop.setToolTip("Stop the running render after its current chunk or segment")
         self.btn_stop.setVisible(False)
-        for b in (self.btn_play_last, self.btn_stop_audio, self.btn_open_out, self.btn_stop):
+        for b, glyph in ((self.btn_play_last, "play"), (self.btn_stop_audio, "square"),
+                         (self.btn_open_out, "folder-open"), (self.btn_stop, "square")):
             set_role(b, "quiet")
+            icons.apply(b, glyph)
             row.addWidget(b)
         lay.addLayout(row)
+        # Stop audio is only live while the player reports audio; the player is asked, never assumed.
+        self.btn_stop_audio.setEnabled(False)
+        self.btn_stop_audio.setToolTip(STOP_AUDIO_IDLE_TIP)
+        self.audio_timer = QtCore.QTimer(self)
+        self.audio_timer.setInterval(250)
+        self.audio_timer.timeout.connect(self._refresh_audio_state)
+        self.audio_timer.start()
         return footer
 
     def status(self, msg):
         self.lbl_status.setText(msg)
+        kind = "error" if msg.startswith(("Error", "Playback error", "Couldn't")) else (
+            "ok" if msg == READY_STATUS else None)
+        glyph = {"error": "circle-exclamation-point", "ok": "circle-check"}.get(kind)
+        if glyph:
+            self.lbl_status_icon.setPixmap(icons.icon(glyph, icons.SIZE_COMPACT, "error" if kind == "error" else "default", gap=0)
+                                           .pixmap(icons.SIZE_COMPACT, icons.SIZE_COMPACT))
+        self.lbl_status_icon.setVisible(bool(glyph))
+
+    def _refresh_audio_state(self):
+        playing = audio_player.is_playing()
+        if playing != self.btn_stop_audio.isEnabled():
+            self.btn_stop_audio.setEnabled(playing)
+            self.btn_stop_audio.setToolTip(STOP_AUDIO_TIP if playing else STOP_AUDIO_IDLE_TIP)
+
+    def stop_audio(self):
+        audio_player.stop()
+        self._refresh_audio_state()
+
+    def open_output_folder(self):
+        """Open the renders folder; recreate it if it was removed, and say so if the system can't open it."""
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+        except OSError as exc:
+            self.status(f"Couldn't open the output folder: {exc}")
+            return
+        if not QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(OUTPUT_DIR)):
+            self.status(f"Couldn't open the output folder: {OUTPUT_DIR}")
 
     def play(self, path):
         try:
             audio_player.play(path)
+            self._refresh_audio_state()
         except Exception as e:
             self.status(f"Playback error: {e}")
 
@@ -635,7 +686,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- left column: describe and generate
     def _build_creation_column(self):
         col = QtWidgets.QVBoxLayout()
-        col.setSpacing(12)
+        col.setSpacing(8)
         lbl = QtWidgets.QLabel("Voice description")
         self.lbl_vd_description = lbl
         set_role(lbl, "field")
@@ -653,6 +704,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_vd_field_error.setVisible(False)
         col.addWidget(self.lbl_vd_field_error)
 
+        col.addSpacing(8)
         caption = QtWidgets.QLabel("Suggestions")
         set_role(caption, "caption")
         col.addWidget(caption)
@@ -670,10 +722,11 @@ class MainWindow(QtWidgets.QMainWindow):
         chips.addStretch(1)
         col.addLayout(chips)
 
-        col.addSpacing(8)
+        col.addSpacing(16)
         gen = QtWidgets.QHBoxLayout()
         self.btn_vd_generate = QtWidgets.QPushButton("Generate voice")
         set_role(self.btn_vd_generate, "primary")
+        icons.apply(self.btn_vd_generate, "audio-lines", icons.SIZE_COMPACT, "primary")
         self.btn_vd_generate.setMinimumWidth(180)
         self.btn_vd_generate.setToolTip(f"Generate voice ({shortcut_text()})")
         self.btn_vd_generate.setAccessibleDescription(f"Keyboard shortcut {shortcut_text()}")
@@ -761,6 +814,7 @@ class MainWindow(QtWidgets.QMainWindow):
         player = QtWidgets.QHBoxLayout()
         player.setSpacing(12)
         self.btn_vd_play = QtWidgets.QPushButton("Play")
+        icons.apply(self.btn_vd_play, "play")
         self.btn_vd_play.setToolTip("Play the generated sample")
         self.btn_vd_play.clicked.connect(self.play_sample)
         player.addWidget(self.btn_vd_play)
@@ -771,12 +825,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_vd_origin.setAccessibleName("Sample made from")
         set_role(self.lbl_vd_origin, "muted")
         rl.addWidget(self.lbl_vd_origin)
+        self.frm_vd_stale = QtWidgets.QFrame()
+        set_role(self.frm_vd_stale, "callout")
+        callout = QtWidgets.QVBoxLayout(self.frm_vd_stale)
+        callout.setContentsMargins(12, 10, 12, 10)
         self.lbl_vd_stale = WrapLabel(
-            "The description or language has changed since this sample was made. "
-            "Save keeps the original; Generate voice makes a new one.")
+            "Description or language changed. "
+            "Save keeps the original; Generate voice makes a new sample.")
         set_role(self.lbl_vd_stale, "notice")
+        callout.addWidget(self.lbl_vd_stale)
+        self.frm_vd_stale.setVisible(False)
         self.lbl_vd_stale.setVisible(False)
-        rl.addWidget(self.lbl_vd_stale)
+        rl.addWidget(self.frm_vd_stale)
+        rl.addSpacing(4)
+        divider = QtWidgets.QFrame()
+        set_role(divider, "divider")
+        rl.addWidget(divider)
+        rl.addSpacing(4)
         name_lbl = QtWidgets.QLabel("Voice name")
         set_role(name_lbl, "field")
         rl.addWidget(name_lbl)
@@ -789,6 +854,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edt_vd_name.textChanged.connect(lambda _t: self._refresh_save_button())
         save_row.addWidget(self.edt_vd_name, 1)
         self.btn_vd_save = QtWidgets.QPushButton("Save")
+        icons.apply(self.btn_vd_save, "save")
         self.btn_vd_save.setEnabled(False)
         self.btn_vd_save.clicked.connect(self.save_voice)
         save_row.addWidget(self.btn_vd_save)
@@ -800,9 +866,11 @@ class MainWindow(QtWidgets.QMainWindow):
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(8)
         self.btn_vd_download = QtWidgets.QPushButton("Download")
+        icons.apply(self.btn_vd_download, "download")
         self.btn_vd_download.setToolTip("Export the sample as a WAV file")
         self.btn_vd_download.clicked.connect(self.download_sample)
         self.btn_vd_regenerate = QtWidgets.QPushButton("Regenerate")
+        icons.apply(self.btn_vd_regenerate, "refresh-cw")
         self.btn_vd_regenerate.setToolTip("Generate another sample from the current description")
         self.btn_vd_regenerate.clicked.connect(self.generate_sample)
         actions.addWidget(self.btn_vd_download)
@@ -875,9 +943,10 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addLayout(lang_box)
 
         row.addStretch(1)
-        self.btn_vd_advanced = QtWidgets.QPushButton("Advanced settings  ▸")
+        self.btn_vd_advanced = QtWidgets.QPushButton("Advanced settings")
         self.btn_vd_advanced.setCheckable(True)
         self.btn_vd_advanced.setAccessibleName("Advanced settings")
+        self._set_advanced_icon(False)
         set_role(self.btn_vd_advanced, "quiet")
         self.btn_vd_advanced.toggled.connect(self._toggle_advanced)
         row.addWidget(self.btn_vd_advanced, 0, QtCore.Qt.AlignBottom)
@@ -947,7 +1016,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _toggle_advanced(self, on):
         self.vd_advanced.setVisible(on)
-        self.btn_vd_advanced.setText("Advanced settings  ▾" if on else "Advanced settings  ▸")
+        self._set_advanced_icon(on)
+
+    def _set_advanced_icon(self, expanded):
+        """The chevron shows the state, and the accessible description says it in words."""
+        icons.apply(self.btn_vd_advanced, "chevron-down" if expanded else "chevron-right")
+        self.btn_vd_advanced.setAccessibleDescription("Expanded" if expanded else "Collapsed")
 
     def _update_compute_summary(self):
         device, dtype, attn = self.model_settings()
@@ -1009,11 +1083,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.pending_voice:  # keep the last good sample available
             self._set_preview(PV_READY)
             self._vd_notice(f"Couldn't generate a new sample. {friendly} Your previous sample is still available.")
+            self.status("Couldn't generate a new sample. Your previous sample is still available.")
             return
         self.lbl_vd_error.setText(friendly)
         self.lbl_vd_details.setText(message)
         self.btn_vd_details.setChecked(False)
         self._set_preview(PV_ERROR)
+        self.status("Couldn't generate the sample. See the Preview for details.")  # details stay in the Preview
 
     def _on_description_changed(self):
         self.lbl_vd_field_error.setVisible(False)
@@ -1043,7 +1119,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_stale_note(self):
         stale = self._sample_is_stale() and self.vd_preview.currentIndex() == PV_READY
         self.lbl_vd_stale.setVisible(stale)
+        self.frm_vd_stale.setVisible(stale)
         self.lbl_vd_preview_title.setText("Previous sample" if stale else "Preview")
+        # The footer must not claim the sample matches the form while it does not.
+        if stale and self.lbl_status.text() == READY_STATUS:
+            self.status(STALE_STATUS)
+        elif not stale and self.lbl_status.text() == STALE_STATUS:
+            self.status(READY_STATUS)
         self._refresh_save_button()
         self._relayout_preview()
 
@@ -1110,7 +1192,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pending_voice = result
             self.lbl_vd_seed_used.setText(f"Seed used: {result['seed']}")
             self._show_ready(result)
-            self.status("Sample ready. Listen, then name and save the voice if you like it.")
+            self.status(READY_STATUS)
             self.play(result["preview"])
             if self.chk_vd_autosave.isChecked():
                 gender = self.cmb_vd_name_gender.currentText().lower()
@@ -1449,10 +1531,14 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addLayout(sel_row)
 
         self.tv_voices.itemSelectionChanged.connect(self._refresh_voice_actions)
-        self.refresh_voices_tab()
+        self._fill_voices_table()  # silent: a library count is not the status of the Create Voice task
         return page
 
     def refresh_voices_tab(self):
+        count = self._fill_voices_table()
+        self.status(f"{count} voice(s) found.")
+
+    def _fill_voices_table(self):
         details = voice_library.list_voice_details()
         self.tv_voices.setRowCount(len(details))
         for r, d in enumerate(details):
@@ -1468,7 +1554,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tv_voices.item(r, 0).setData(QtCore.Qt.UserRole, d["slug"])
         self.lbl_voices_empty.setVisible(not details)
         self._refresh_voice_actions()
-        self.status(f"{len(details)} voice(s) found.")
+        return len(details)
 
     def _refresh_voice_actions(self):
         """Engine references need exactly one saved voice; handlers keep their own error fallback."""

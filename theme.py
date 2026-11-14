@@ -33,6 +33,14 @@ COLORS = {
     "accent": "#F25C07",
     "accent_hover": "#FF7A2E",
     "on_accent": "#101114",       # white on the accent is only 3.3:1
+    # Primary action (Generate voice): a deeper orange so white text reads clearly.
+    "primary": "#C5540A",
+    "primary_hover": "#B24C08",
+    "primary_pressed": "#A94708",
+    "primary_pressed_edge": "#7E3405",
+    "primary_disabled": "#6B4A38",
+    "on_primary": "#FFFFFF",
+    "on_primary_disabled": "#D9C9BF",  # softened white; still readable on primary_disabled
     "selection": "#3A3F4B",       # neutral selection, not an orange fill
     "success": "#46BA82",
     "error": "#F07878",
@@ -101,14 +109,14 @@ QMenu::item:selected {{ background: {c['nav_selected']}; color: {c['text']}; }}
 QMenu::item:disabled {{ color: {c['text_disabled']}; }}
 
 QPushButton[role="primary"] {{
-    background: {c['accent']}; color: {c['on_accent']}; border: 1px solid {c['accent']};
+    background: {c['primary']}; color: {c['on_primary']}; border: 1px solid {c['primary']};
     font-weight: 600; padding: 10px 24px;
 }}
-QPushButton[role="primary"]:hover {{ background: {c['accent_hover']}; border-color: {c['accent_hover']}; }}
-QPushButton[role="primary"]:pressed {{ background: {c['accent']}; }}
-QPushButton[role="primary"]:focus {{ border: 2px solid {c['text']}; padding: 9px 23px; }}
+QPushButton[role="primary"]:hover {{ background: {c['primary_hover']}; border-color: {c['primary_hover']}; }}
+QPushButton[role="primary"]:pressed {{ background: {c['primary_pressed']}; border-color: {c['primary_pressed_edge']}; }}
+QPushButton[role="primary"]:focus {{ border: 2px solid {c['text']}; padding: 9px 23px; outline: none; }}
 QPushButton[role="primary"]:disabled {{
-    background: {c['sidebar']}; color: {c['text_disabled']}; border: 1px solid {c['border']};
+    background: {c['primary_disabled']}; color: {c['on_primary_disabled']}; border: 1px solid {c['primary_disabled']};
 }}
 
 QPushButton[role="quiet"] {{
@@ -208,6 +216,8 @@ QFrame#sidebar {{ background: {c['sidebar']}; border: none; border-right: 1px so
 QFrame#footer {{ background: {c['canvas']}; border: none; border-top: 1px solid {c['border']}; }}
 QFrame#previewPanel {{ background: {c['surface']}; border: 1px solid {c['border']}; border-radius: {s}px; }}
 QFrame#previewPanel[empty="true"] {{ background: transparent; }}
+QFrame[role="callout"] {{ background: {c['canvas']}; border: 1px solid {c['border']}; border-radius: {r}px; }}
+QFrame[role="callout"] QLabel {{ background: transparent; border: none; }}
 QFrame[role="divider"] {{ background: {c['border']}; border: none; max-height: 1px; min-height: 1px; }}
 
 /* ---- text roles */

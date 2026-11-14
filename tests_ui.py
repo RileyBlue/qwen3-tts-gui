@@ -19,10 +19,11 @@ from PySide6.QtTest import QTest
 
 import audio_player
 import qt_app
+import icons
 import theme
 import voice_library
 PAGE_VOICES = 2
-from qt_app import CONTENT_MAX_WIDTH, MainWindow, configure_keyboard_navigation, PV_BUSY, PV_EMPTY, PV_ERROR, PV_READY
+from qt_app import CONTENT_MAX_WIDTH, MainWindow, READY_STATUS, STALE_STATUS, configure_keyboard_navigation, PV_BUSY, PV_EMPTY, PV_ERROR, PV_READY
 
 
 class _StubModels:
@@ -195,7 +196,9 @@ def _test_generation_failure_shows_error_and_keeps_input():
         _wait_idle(win)
         assert stub.calls == ["voice-design"]
         assert win.vd_preview.currentIndex() == PV_ERROR
-        assert win.lbl_status.text().startswith("Error")
+        # the footer is a concise status; the Preview owns the explanation and the details
+        assert win.lbl_status.text().startswith("Couldn't generate") and "must not be loaded" not in win.lbl_status.text()
+        assert not win.lbl_status_icon.isHidden(), "an error status carries its glyph as well as its words"
         assert "Couldn't" in win.lbl_vd_error.text() or "wrong" in win.lbl_vd_error.text()
         assert "must not be loaded" in win.lbl_vd_details.text()
         assert win.txt_vd_instruct.toPlainText() == "A gravelly old sailor"
@@ -562,6 +565,292 @@ def _test_tab_leaves_description_under_the_macos_default_tab_behavior():
     print("PASS: Tab/Shift+Tab leave the description under the macOS default tab behavior; Enter adds a line")
 
 
+def _test_stale_sample_callout_and_footer_status():
+    with _Patched():
+        win, _ = _make_window(models=_FakeModels())
+        _shown(win)
+        win.edt_vd_name.setText("Narrator")
+        _generate(win, "Warm narrator")
+        assert win.lbl_status.text() == READY_STATUS
+        assert win.frm_vd_stale.isHidden() and win.lbl_vd_stale.isHidden()
+        win.txt_vd_instruct.setPlainText("Bright announcer")
+        _app.processEvents()
+        # the inset callout carries the note; the footer must not claim the sample matches the form
+        assert not win.frm_vd_stale.isHidden() and not win.lbl_vd_stale.isHidden()
+        assert win.frm_vd_stale.isAncestorOf(win.lbl_vd_stale)
+        assert win.lbl_status.text() == STALE_STATUS
+        assert win.lbl_vd_stale.height() >= win.lbl_vd_stale.heightForWidth(win.lbl_vd_stale.width()), "note is clipped"
+        win.txt_vd_instruct.setPlainText("Warm narrator")
+        _app.processEvents()
+        assert win.frm_vd_stale.isHidden() and win.lbl_status.text() == READY_STATUS
+        # an unrelated status message is never overwritten
+        win.status("Saved as 'x'.")
+        win.txt_vd_instruct.setPlainText("Another")
+        _app.processEvents()
+        assert win.lbl_status.text() == "Saved as 'x'."
+        win.close()
+    print("PASS: a changed input shows the callout and a matching footer status, and reverting restores both")
+
+
+_USED_ICONS = {"wand-sparkles", "copy", "mic-vocal", "book-open", "settings", "audio-lines", "play", "save",
+               "download", "refresh-cw", "chevron-right", "chevron-down",
+               "square", "folder-open", "circle-check", "circle-exclamation-point"}
+
+
+def _test_icon_assets_are_vendored_licensed_and_only_the_used_ones():
+    on_disk = {f[:-4] for f in os.listdir(icons.ICON_DIR) if f.endswith(".svg")}
+    assert on_disk == _USED_ICONS, f"vendor only the icons in use: {on_disk ^ _USED_ICONS}"
+    licence = open(os.path.join(icons.ICON_DIR, "LICENSE"), encoding="utf-8").read()
+    assert "ISC License" in licence and "Lucide" in licence and "Feather" in licence and "MIT License" in licence
+    _make_window()
+    for name in _USED_ICONS:
+        for size in (icons.SIZE_COMPACT, icons.SIZE_NAV):
+            assert not icons.icon(name, size).isNull(), name
+    print("PASS: exactly the used Lucide icons are vendored, with the ISC and MIT Feather notices")
+
+
+def _test_icons_use_theme_colours_per_state_and_are_high_dpi():
+    _make_window()
+    size = QtCore.QSize(16, 16)
+
+    def has_colour(icon, hex_colour, mode=QtGui.QIcon.Normal, state=QtGui.QIcon.Off):
+        """True if the rendered glyph contains the colour (antialiasing rounds channels by 1-2)."""
+        want = QtGui.QColor(hex_colour)
+        image = icon.pixmap(size, 1.0, mode, state).toImage()
+        for x in range(image.width()):
+            for y in range(image.height()):
+                c = image.pixelColor(x, y)
+                if c.alpha() > 200 and max(abs(c.red() - want.red()), abs(c.green() - want.green()),
+                                           abs(c.blue() - want.blue())) <= 3:
+                    return True
+        return False
+
+    ic = icons.icon("save", 16, "default")
+    assert has_colour(ic, theme.COLORS["text_secondary"])                               # resting
+    assert has_colour(ic, theme.COLORS["text_disabled"], QtGui.QIcon.Disabled)          # disabled
+    assert has_colour(ic, theme.COLORS["text"], QtGui.QIcon.Normal, QtGui.QIcon.On)     # checked / selected
+    assert has_colour(ic, theme.COLORS["text"], QtGui.QIcon.Active)                     # keyboard focus
+    assert not has_colour(ic, theme.COLORS["text"], QtGui.QIcon.Normal), "resting icons stay neutral and quiet"
+    primary = icons.icon("audio-lines", 16, "primary")
+    assert has_colour(primary, theme.COLORS["on_primary"]), "the primary action's icon is white, like its label"
+    assert has_colour(primary, theme.COLORS["on_primary_disabled"], QtGui.QIcon.Disabled)
+    assert ic.pixmap(size, 2.0).width() >= 32, "a 2x pixmap must exist for high-DPI displays"
+    print("PASS: icons take theme colours for normal, selected, focused and disabled states and ship 2x pixmaps")
+
+
+def _test_missing_icon_assets_degrade_to_the_text_label():
+    _make_window()
+    assert icons.icon("no-such-icon").isNull()
+    button = QtWidgets.QPushButton("Label")
+    icons.apply(button, "no-such-icon")
+    assert button.text() == "Label" and button.icon().isNull()
+    print("PASS: a missing icon asset leaves the labelled button intact")
+
+
+def _test_create_voice_and_navigation_icons_never_replace_labels():
+    win, _ = _make_window()
+    win.resize(1024, 640)
+    _shown(win)
+    labelled = {
+        "nav": win.nav_buttons,
+        "actions": [win.btn_vd_generate, win.btn_vd_play, win.btn_vd_save, win.btn_vd_download,
+                    win.btn_vd_regenerate, win.btn_vd_advanced],
+    }
+    for button in labelled["nav"] + labelled["actions"]:
+        assert not button.icon().isNull(), button.text()
+        assert button.text().strip(), "icons never replace the text label"
+        need = button.fontMetrics().horizontalAdvance(button.text()) + button.iconSize().width() + 16
+        assert button.width() >= need, f"{button.text()!r} clips its text next to the icon"
+    assert [b.text() for b in win.nav_buttons] == ["Create Voice", "Clone Voice", "My Voices", "Audiobooks", "Settings"]
+    assert win.btn_vd_generate.text() == "Generate voice" and win.btn_vd_generate.accessibleName() in ("", "Generate voice")
+    assert all(chip.icon().isNull() for chip, _n, _p in win.vd_chips), "suggestion chips stay text-only"
+    # the disclosure says its state in words too, not by chevron alone
+    assert win.btn_vd_advanced.accessibleDescription() == "Collapsed"
+    win.btn_vd_advanced.click()
+    assert win.btn_vd_advanced.accessibleDescription() == "Expanded"
+    assert win.btn_vd_advanced.text() == "Advanced settings"
+    # selected navigation uses the checked (On) icon, resting items the normal one
+    assert win.nav_buttons[0].isChecked() and not win.nav_buttons[1].isChecked()
+    win.close()
+    print("PASS: Create Voice and navigation icons keep text labels, accessible names and chip text-only")
+
+
+def _test_primary_button_uses_the_specified_orange_and_white_content():
+    win, _ = _make_window()
+    _shown(win)
+    c = theme.COLORS
+    assert (c["primary"], c["primary_hover"], c["primary_pressed"], c["primary_disabled"], c["on_primary"]) == \
+        ("#C5540A", "#B24C08", "#A94708", "#6B4A38", "#FFFFFF")
+    button = win.btn_vd_generate
+
+    def fill():
+        _app.processEvents()
+        return button.grab().toImage().pixelColor(4, button.height() // 2).name().upper()
+
+    win.nav_buttons[0].setFocus()
+    assert fill() == c["primary"]
+    QTest.mouseMove(button, button.rect().center())
+    _app.processEvents()
+    assert fill() == c["primary_hover"]
+    QTest.mousePress(button, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, button.rect().center())
+    assert fill() == c["primary_pressed"]
+    edge = button.grab().toImage().pixelColor(0, button.height() // 2).name().upper()
+    assert edge == c["primary_pressed_edge"], "pressed has an edge hover lacks, so the two never rely on a ~1.09:1 fill difference alone"
+    assert c["primary_pressed_edge"] != c["primary_hover"] != c["primary_pressed"]
+    # release outside the button so the press is cancelled and no generation starts
+    QTest.mouseRelease(button, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, QtCore.QPoint(-20, -20))
+    assert not win.busy
+    QTest.mouseMove(win.lbl_vd_description, QtCore.QPoint(2, 2))
+    button.setEnabled(False)
+    assert fill() == c["primary_disabled"]
+    button.setEnabled(True)
+    # label and glyph are white; size is unchanged; the keyboard focus ring stays visible
+    assert button.size() == QtCore.QSize(180, 42), button.size()
+    image = button.icon().pixmap(button.iconSize(), 1.0, QtGui.QIcon.Normal).toImage()
+    assert any(image.pixelColor(x, y).alpha() > 200 and image.pixelColor(x, y).name().upper() == "#FFFFFF"
+               for x in range(image.width()) for y in range(image.height())), "the icon must be white"
+    win.vd_chips[-1][0].setFocus()
+    _app.processEvents()
+    QTest.keyClick(win.windowHandle(), QtCore.Qt.Key_Tab)
+    _app.processEvents()
+    assert win.focusWidget() is button
+    ring = button.grab().toImage().pixelColor(button.width() // 2, 0).name().upper()
+    assert ring == c["text"].upper(), f"focus ring not visible: {ring}"
+    win.close()
+    print("PASS: Generate voice renders the specified orange in every state with a white icon, label and visible focus ring")
+
+
+def _test_footer_actions_have_labels_icons_and_preserved_handlers():
+    win, _ = _make_window()
+    win.resize(1024, 640)
+    _shown(win)
+    expected = {win.btn_stop_audio: "Stop audio", win.btn_open_out: "Open output folder",
+                win.btn_play_last: "Play last output", win.btn_stop: "Stop generation"}
+    for button, label in expected.items():
+        assert button.text() == label and not button.icon().isNull(), label
+        assert button.iconSize().height() == icons.SIZE_COMPACT
+        assert qt_app.__dict__ and button.property("role") == "quiet", "footer actions stay neutral and secondary"
+    assert win.btn_stop_audio.icon().cacheKey() != win.btn_open_out.icon().cacheKey()
+    # Stop audio keeps calling audio_player.stop
+    stopped = []
+    real_stop, real_playing = audio_player.stop, audio_player.is_playing
+    audio_player.stop = lambda: stopped.append(1)
+    audio_player.is_playing = lambda: True
+    try:
+        win._refresh_audio_state()
+        assert win.btn_stop_audio.isEnabled()
+        win.btn_stop_audio.click()
+        assert stopped == [1]
+    finally:
+        audio_player.stop, audio_player.is_playing = real_stop, real_playing
+    # Open output folder keeps opening OUTPUT_DIR (and says so if the system refuses)
+    opened = []
+    real_open = QtGui.QDesktopServices.openUrl
+    QtGui.QDesktopServices.openUrl = staticmethod(lambda url: opened.append(url.toLocalFile()) or True)
+    try:
+        win.btn_open_out.click()
+        assert opened == [qt_app.OUTPUT_DIR], opened
+        QtGui.QDesktopServices.openUrl = staticmethod(lambda url: False)
+        win.btn_open_out.click()
+        assert win.lbl_status.text().startswith("Couldn't open the output folder")
+    finally:
+        QtGui.QDesktopServices.openUrl = real_open
+    win.close()
+    print("PASS: footer actions keep labels, neutral role and 16 px icons; Stop audio and Open folder keep their handlers")
+
+
+def _test_stop_audio_follows_the_players_real_state():
+    win, _ = _make_window()
+    _shown(win)
+    state = {"playing": False}
+    real_playing = audio_player.is_playing
+    audio_player.is_playing = lambda: state["playing"]
+    try:
+        win._refresh_audio_state()
+        assert not win.btn_stop_audio.isEnabled() and win.btn_stop_audio.toolTip() == qt_app.STOP_AUDIO_IDLE_TIP
+        state["playing"] = True
+        win._refresh_audio_state()
+        assert win.btn_stop_audio.isEnabled() and win.btn_stop_audio.toolTip() == qt_app.STOP_AUDIO_TIP
+        state["playing"] = False                      # playback finished by itself
+        win.audio_timer.timeout.emit()
+        assert not win.btn_stop_audio.isEnabled(), "back to idle once the player reports silence"
+        assert win.audio_timer.isActive() and win.audio_timer.interval() == 250
+    finally:
+        audio_player.is_playing = real_playing
+    # the read-only query never initialises or starts anything
+    audio_player._proc = None
+    assert audio_player.is_playing() in (True, False)
+    win.close()
+    print("PASS: Stop audio is enabled only while the player reports audio, and returns to idle by itself")
+
+
+def _test_footer_status_is_contextual_and_never_duplicates_errors():
+    original = voice_library.VOICES_DIR
+    voice_library.VOICES_DIR = tempfile.mkdtemp()
+    try:
+        win, _ = _make_window()
+        assert win.lbl_status.text() == "Ready", "the Create Voice screen must not open on a library count"
+        assert win.lbl_status_icon.isHidden()
+        win.refresh_voices_tab()                      # an explicit refresh may announce the count
+        assert win.lbl_status.text() == "0 voice(s) found."
+        win.status(READY_STATUS)
+        assert not win.lbl_status_icon.isHidden() and win.lbl_status.text() == READY_STATUS
+        win.status("Error: boom")
+        assert not win.lbl_status_icon.isHidden()
+        win.status("Ready")
+        assert win.lbl_status_icon.isHidden(), "plain states show no glyph"
+        win.close()
+    finally:
+        voice_library.VOICES_DIR = original
+    with _Patched():
+        win, _ = _make_window()                       # stub models raise a long technical message
+        win.txt_vd_instruct.setPlainText("A gravelly old sailor")
+        win.btn_vd_generate.click()
+        _wait_idle(win)
+        assert win.lbl_vd_details.text() and win.lbl_vd_details.text() not in win.lbl_status.text()
+        assert "Preview" in win.lbl_status.text()
+        win.close()
+    print("PASS: the footer says Ready at launch, uses a glyph for ready/error, and never repeats error details")
+
+
+def _test_footer_fits_and_is_keyboard_reachable_at_minimum_width():
+    win, _ = _make_window()
+    win.resize(1024, 640)
+    _shown(win)
+    for page in range(5):
+        win.show_page(page)
+        _app.processEvents()
+        footer = win.btn_open_out.parentWidget()
+        for button in (win.btn_stop_audio, win.btn_open_out, win.btn_play_last):
+            if button.isHidden():
+                continue
+            top_left = button.mapTo(win, QtCore.QPoint(0, 0))
+            assert QtCore.QRect(top_left, button.size()).right() <= win.width(), f"{button.text()!r} clips at 1024 px"
+            need = button.fontMetrics().horizontalAdvance(button.text()) + button.iconSize().width() + 16
+            assert button.width() >= need, f"{button.text()!r} is squeezed"
+        assert footer.height() <= 60, f"footer is {footer.height()} px tall"
+    # Tab reaches Open output folder; Stop audio only joins the order while audio plays
+    win.show_page(0)
+    audio_player.is_playing, real = (lambda: False), audio_player.is_playing
+    try:
+        win._refresh_audio_state()
+        win.btn_open_out.setFocus()
+        _app.processEvents()
+        assert win.focusWidget() is win.btn_open_out
+        assert not win.btn_stop_audio.focusPolicy() == QtCore.Qt.NoFocus
+        assert not win.btn_stop_audio.isEnabled(), "disabled controls must not take Tab"
+        audio_player.is_playing = lambda: True
+        win._refresh_audio_state()
+        assert win.btn_stop_audio.isEnabled()
+        win.btn_stop_audio.setFocus(QtCore.Qt.TabFocusReason)
+        _app.processEvents()
+        assert win.focusWidget() is win.btn_stop_audio
+    finally:
+        audio_player.is_playing = real
+    win.close()
+    print("PASS: footer actions fit at 1024 px on every page and stay keyboard-reachable")
+
+
 def _test_create_voice_layout_at_minimum_and_wide_sizes():
     with _Patched():
         win, _ = _make_window(models=_FakeModels())
@@ -645,10 +934,10 @@ def _focus_cycle(win, backwards=False, limit=45):
 
 _CHIPS = ["Narration", "Relaxing", "Epic", "Professional"]
 _EMPTY_ORDER = (["Create Voice", "Voice description"] + _CHIPS
-                + ["Generate voice", "combo:english", "Advanced settings ▸", "Stop audio", "Open output folder"])
+                + ["Generate voice", "combo:english", "Advanced settings", "Open output folder"])
 _READY_ORDER = (["Create Voice", "Voice description"] + _CHIPS
                 + ["Generate voice", "Play", "Voice name", "Save", "Download", "Regenerate",
-                   "combo:english", "Advanced settings ▸", "Stop audio", "Open output folder"])
+                   "combo:english", "Advanced settings", "Open output folder"])
 
 
 def _test_tab_leaves_description_and_multiline_entry_still_works():
@@ -712,9 +1001,9 @@ def _test_keyboard_focus_order_is_logical():
         win.btn_vd_advanced.click()
         _app.processEvents()
         order = _focus_cycle(win)
-        after = order[order.index("Advanced settings ▾") + 1:]
+        after = order[order.index("Advanced settings") + 1:]
         assert after == ["combo:Random", "Auto-save generated voices", "combo:Random", "Suggest name",
-                         "Audition text", "Open Settings", "Stop audio", "Open output folder"], after
+                         "Audition text", "Open Settings", "Open output folder"], after
         assert not [l for l in order if l.startswith("?")]
         win.hide()
     print("PASS: Tab order = navigation, form, Generate, preview, settings, footer; no invisible stops")
@@ -907,8 +1196,12 @@ def _test_theme_rules_and_contrast():
         "muted on canvas": (c["text_muted"], c["canvas"], 4.5),
         "muted on surface": (c["text_muted"], c["surface"], 4.5),
         "muted on sidebar": (c["text_muted"], c["sidebar"], 4.5),
-        "text on primary button": (c["on_accent"], c["accent"], 4.5),
-        "text on primary hover": (c["on_accent"], c["accent_hover"], 4.5),
+        "text on primary button": (c["on_primary"], c["primary"], 4.5),
+        "text on primary pressed": (c["on_primary"], c["primary_pressed"], 4.5),
+        "text on primary disabled": (c["on_primary_disabled"], c["primary_disabled"], 4.5),
+        "text on primary hover": (c["on_primary"], c["primary_hover"], 4.5),
+        "primary button on canvas": (c["primary"], c["canvas"], 3.0),
+        "focus ring on primary": (c["text"], c["primary"], 3.0),
         "text on selection": (c["text"], c["selection"], 4.5),
         "nav selected text": (c["text"], c["nav_selected"], 4.5),
         "nav hover text": (c["text"], c["nav_hover"], 4.5),
@@ -961,6 +1254,16 @@ def run_ui_tests():
     _test_my_voices_tab_order()
     _test_multiline_editors_never_trap_the_keyboard()
     _test_tab_leaves_description_under_the_macos_default_tab_behavior()
+    _test_stale_sample_callout_and_footer_status()
+    _test_icon_assets_are_vendored_licensed_and_only_the_used_ones()
+    _test_icons_use_theme_colours_per_state_and_are_high_dpi()
+    _test_missing_icon_assets_degrade_to_the_text_label()
+    _test_create_voice_and_navigation_icons_never_replace_labels()
+    _test_primary_button_uses_the_specified_orange_and_white_content()
+    _test_footer_actions_have_labels_icons_and_preserved_handlers()
+    _test_stop_audio_follows_the_players_real_state()
+    _test_footer_status_is_contextual_and_never_duplicates_errors()
+    _test_footer_fits_and_is_keyboard_reachable_at_minimum_width()
     _test_create_voice_layout_at_minimum_and_wide_sizes()
     _test_busy_toggles_action_buttons()
     _test_single_primary_button_and_neutral_nav()

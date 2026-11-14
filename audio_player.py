@@ -2,6 +2,7 @@
 
 import shutil
 import subprocess
+import sys
 
 _proc = None
 
@@ -40,3 +41,18 @@ def play(path):
             _proc = subprocess.Popen(cmd + [path])
             return
     raise RuntimeError("No audio player found (install pygame, or paplay/pw-play/ffplay).")
+
+
+def is_playing():
+    """True while audio started by play() is still audible. Read-only: never starts or stops anything.
+
+    pygame is only asked if it is already imported and its mixer already initialised, so asking never
+    opens an audio device. The system-player fallback is a subprocess that is alive while it plays.
+    """
+    pg = sys.modules.get("pygame")
+    try:
+        if pg is not None and pg.mixer.get_init() and pg.mixer.music.get_busy():
+            return True
+    except Exception:
+        pass
+    return bool(_proc and _proc.poll() is None)
