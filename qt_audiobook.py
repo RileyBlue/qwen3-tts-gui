@@ -7,6 +7,7 @@ from PySide6 import QtCore, QtWidgets
 import audiobook
 from audio_utils import write_wav
 from config import DEFAULT_LANGUAGE, LANGUAGES, OUTPUT_DIR
+from theme import set_role
 from voice_lock import EMOTION_PRESETS
 
 COL_NUM, COL_TYPE, COL_VOICE, COL_DIR, COL_TEXT = range(5)
@@ -124,7 +125,7 @@ class AudiobookTab(QtWidgets.QWidget):
             "Unchanged segments are cached, so re-rendering after an edit only regenerates what changed. "
             "Direction accepts any free text (same as [tag] in the other tabs).")
         note.setWordWrap(True)
-        note.setStyleSheet("color: gray")
+        set_role(note, "muted")
         outer.addWidget(note)
 
         # ---- action bar

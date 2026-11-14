@@ -52,18 +52,20 @@ class TTSGenerator:
         return jobs
 
     # ---- VoiceDesign: voice creation
-    def design_sample(self, description, language, seed):
+    def design_sample(self, description, language, seed, text=None):
+        """`text` is what the voice says; None keeps the standard audition passage."""
         model = self.models.get("voice-design", self.notify)
         seed_everything(seed)
         wavs, sr = model.generate_voice_design(
-            text=voice_library.SAMPLE_TEXT, language=language, instruct=description
+            text=text or voice_library.SAMPLE_TEXT, language=language, instruct=description
         )
         return _first(wavs), sr
 
-    def build_voice_prompt(self, wav, sr):
+    def build_voice_prompt(self, wav, sr, text=None):
+        """`text` must be the words spoken in `wav` (the clone prompt aligns the audio to them)."""
         base = self.models.get("voice-clone", self.notify)
         return base.create_voice_clone_prompt(
-            ref_audio=(wav, sr), ref_text=voice_library.SAMPLE_TEXT, x_vector_only_mode=False
+            ref_audio=(wav, sr), ref_text=text or voice_library.SAMPLE_TEXT, x_vector_only_mode=False
         )
 
     def build_clone_prompt(self, ref_audio, ref_text, x_vector_only=False):
