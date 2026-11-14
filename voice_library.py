@@ -70,8 +70,10 @@ def voice_exists(name, root=None):
 
 
 def save_voice(name, wav, sr, prompt, description, language, seed,
-               model_ids=None, root=None, overwrite=False):
-    """Write a voice folder and return its config dict."""
+               model_ids=None, root=None, overwrite=False, sample_text=None):
+    """Write a voice folder and return its config dict. `sample_text` is the text spoken in `wav`
+    (default: the standard audition passage); it is stored as sample_text and ref_text."""
+    sample_text = sample_text or SAMPLE_TEXT
     if not slugify(name):
         raise ValueError("Voice name must contain letters or digits.")
     path = voice_dir(name, root)
@@ -91,8 +93,8 @@ def save_voice(name, wav, sr, prompt, description, language, seed,
         "language": language,
         "description": description,
         "seed": int(seed),
-        "sample_text": SAMPLE_TEXT,
-        "ref_text": SAMPLE_TEXT,
+        "sample_text": sample_text,
+        "ref_text": sample_text,
         "ref_audio": "reference.wav",
         "clone_prompt": "clone_prompt.npz",
         "sample_rate": int(sr),
