@@ -9,7 +9,7 @@ Roles
                "chip" (checkable suggestion)
   QLabel:      "title", "subtitle", "heading", "field", "caption", "muted", "pill",
                "brand", "error-title", "notice"
-  QFrame:      "divider"; object names "sidebar", "footer", "previewPanel"
+  QFrame:      "divider", "callout"; QListWidget: "voices" (My Voices rows); object names "sidebar", "footer", "previewPanel"
 """
 
 import os
@@ -158,6 +158,13 @@ QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
     border: 2px solid {c['accent']}; padding: 6px 9px;
 }}
 QPlainTextEdit:focus, QTextEdit:focus {{ border: 2px solid {c['accent']}; padding: 7px 9px; }}
+QPlainTextEdit[role="reader"], QTextEdit[role="reader"] {{
+    background: transparent; border: none; border-left: 2px solid {c['border']}; border-radius: 0;
+    padding: 2px 8px 2px 12px; color: {c['text']};
+}}
+QPlainTextEdit[role="reader"]:focus, QTextEdit[role="reader"]:focus {{
+    border: 2px solid {c['accent']}; border-radius: 4px; padding: 0px 6px 0px 10px;
+}}
 QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QSpinBox:disabled,
 QDoubleSpinBox:disabled, QComboBox:disabled {{
     background: {c['sidebar']}; color: {c['text_disabled']}; border-color: {c['border']};
@@ -180,6 +187,24 @@ QCheckBox::indicator:unchecked {{
 QGroupBox {{ border: 1px solid {c['border']}; border-radius: {s}px; margin-top: 12px; padding-top: 8px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {c['text_secondary']}; }}
 
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: {c['text_disabled']}; border-radius: 3px; min-height: 28px; margin: 0 2px; }}
+QScrollBar::handle:horizontal {{ background: {c['text_disabled']}; border-radius: 3px; min-width: 28px; margin: 2px 0; }}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{ background: {c['text_muted']}; }}
+QScrollBar::handle:vertical:pressed, QScrollBar::handle:horizontal:pressed {{ background: {c['text_secondary']}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; border: none; background: none; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QSlider::groove:horizontal {{ height: 4px; background: {c['border']}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {c['accent']}; border-radius: 2px; }}
+QSlider::handle:horizontal {{ width: 12px; height: 12px; margin: -4px 0; border-radius: 6px;
+    background: {c['text']}; border: 2px solid {c['text']}; }}
+QSlider::handle:horizontal:hover {{ background: {c['accent_hover']}; border-color: {c['accent_hover']}; }}
+QSlider::handle:horizontal:focus {{ border: 2px solid {c['accent']}; background: {c['text']}; margin: -6px 0;
+    width: 16px; height: 16px; border-radius: 8px; }}
+QSlider::groove:horizontal:disabled {{ background: {c['border']}; }}
+QSlider::sub-page:horizontal:disabled {{ background: {c['text_disabled']}; }}
+QSlider::handle:horizontal:disabled {{ background: {c['text_disabled']}; border-color: {c['text_disabled']}; }}
 QProgressBar {{ background: {c['surface']}; border: none; border-radius: 2px; }}
 QProgressBar::chunk {{ background: {c['accent']}; border-radius: 2px; }}
 
@@ -188,6 +213,9 @@ QScrollArea {{ background: transparent; border: none; }}
 QTableWidget {{
     background: {c['surface']}; color: {c['text']}; gridline-color: {c['border']};
     border: 1px solid {c['border']}; border-radius: {r}px;
+}}
+QListWidget[role="voices"] {{
+    background: {c['surface']}; border: 1px solid {c['border']}; border-radius: {r}px; outline: none;
 }}
 QTableWidget::item {{ padding: 0 4px; }}
 QTableWidget::item:selected {{ background: {c['selection']}; color: {c['text']}; }}

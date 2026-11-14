@@ -5,8 +5,10 @@ No real model is downloaded or loaded, no audio is played, and no GPU is needed.
 Generation paths run against a stub model, with playback and the output folder patched.
 """
 
+import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -18,10 +20,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtTest import QTest
 
 import audio_player
+from audio_utils import load_wav
 import qt_app
 import icons
 import theme
 import voice_library
+import voice_list
 PAGE_VOICES = 2
 from qt_app import CONTENT_MAX_WIDTH, MainWindow, READY_STATUS, STALE_STATUS, configure_keyboard_navigation, PV_BUSY, PV_EMPTY, PV_ERROR, PV_READY
 
@@ -145,8 +149,9 @@ def _test_create_voice_widgets():
 def _test_advanced_settings_hidden_by_default():
     win, _ = _make_window()
     assert win.vd_advanced.isHidden()
-    for w in (win.cmb_vd_seed_mode, win.chk_vd_autosave, win.cmb_vd_name_gender, win.txt_vd_sample):
+    for w in (win.cmb_vd_seed_mode, win.chk_vd_autosave, win.cmb_vd_name_gender):
         assert win.vd_advanced.isAncestorOf(w)
+    assert not win.vd_advanced.isAncestorOf(win.txt_vd_sample), "Sample text is in the main form"
     win.btn_vd_advanced.click()
     assert not win.vd_advanced.isHidden()
     assert win.model_settings() == (win.cmb_device.currentText(), win.cmb_dtype.currentText(),
@@ -200,7 +205,7 @@ def _test_generation_failure_shows_error_and_keeps_input():
         assert win.lbl_status.text().startswith("Couldn't generate") and "must not be loaded" not in win.lbl_status.text()
         assert not win.lbl_status_icon.isHidden(), "an error status carries its glyph as well as its words"
         assert "Couldn't" in win.lbl_vd_error.text() or "wrong" in win.lbl_vd_error.text()
-        assert "must not be loaded" in win.lbl_vd_details.text()
+        assert "must not be loaded" in win.txt_vd_details.toPlainText()
         assert win.txt_vd_instruct.toPlainText() == "A gravelly old sailor"
         assert win.btn_vd_generate.isEnabled() and win.btn_vd_retry.isEnabled()
     print("PASS: failed generation shows the error state, preserves input, allows retry")
@@ -214,8 +219,7 @@ def _test_generation_success_shows_real_preview():
         _wait_idle(win)
         assert win.vd_preview.currentIndex() == PV_READY
         assert win.pending_voice["description"] == "Warm narrator"
-        assert win.lbl_vd_duration.text() == "0:01", win.lbl_vd_duration.text()
-        assert not win.lbl_vd_duration.isHidden()
+        assert win.lbl_vd_total.text() == "0:01", win.lbl_vd_total.text()
         assert not win.btn_vd_save.isEnabled(), "Save waits for a voice name"
         win.edt_vd_name.setText("Ada")
         assert win.btn_vd_save.isEnabled() and win.btn_vd_regenerate.isEnabled()
@@ -234,6 +238,654 @@ def _test_generation_success_shows_real_preview():
     print("PASS: success shows real duration/waveform; stale note; failure keeps previous sample")
 
 
+# ------------------------------------------------------------------ Preview: sample text and player
+class _RecordingModels:
+    """Fake models that record what the voice is asked to say, and make `seconds` of audio."""
+
+    def __init__(self, seconds=20):
+        self.texts, self.ref_texts, self.seconds = [], [], seconds
+
+    def get(self, kind, notify=None):
+        outer = self
+
+        class Model:
+            def generate_voice_design(self, text, language, instruct):
+                outer.texts.append(text)
+                n = int(24000 * outer.seconds)
+                return [np.sin(np.linspace(0, 440 * outer.seconds, n, dtype=np.float32)) * 0.5], 24000
+
+            def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+                outer.ref_texts.append(ref_text)
+                return {"ref_spk_embedding": np.zeros(4, dtype=np.float32)}
+        return Model()
+
+
+class _FakeAudio:
+    """A controllable stand-in for audio_player with a manual clock, pause, seek and a natural end."""
+
+    NAMES = ("play", "stop", "pause", "resume", "state", "current_path", "position", "seek", "can_control",
+             "is_playing")
+
+    def __init__(self, duration=20.0, control=True):
+        self.duration, self.control = duration, control
+        self.path, self.mode, self.pos = None, "stopped", 0.0
+        self.play_calls, self.fail = [], None
+
+    def __enter__(self):
+        self._saved = {n: getattr(audio_player, n) for n in self.NAMES}
+        for n in self.NAMES:
+            setattr(audio_player, n, getattr(self, "_" + n))
+        return self
+
+    def __exit__(self, *exc):
+        for n, f in self._saved.items():
+            setattr(audio_player, n, f)
+
+    def advance(self, seconds):
+        if self.mode == "playing":
+            self.pos += seconds
+            if self.pos >= self.duration:
+                self.mode, self.path, self.pos = "stopped", None, 0.0   # played to the end
+
+    def _play(self, path, start=0.0):
+        if self.fail:
+            raise RuntimeError(self.fail)
+        self.play_calls.append((path, start))
+        self.path, self.mode, self.pos = path, "playing", start
+
+    def _stop(self):
+        self.path, self.mode, self.pos = None, "stopped", 0.0
+
+    def _pause(self):
+        if self.control and self.mode == "playing":
+            self.mode = "paused"
+            return True
+        return False
+
+    def _resume(self):
+        if self.mode == "paused":
+            self.mode = "playing"
+            return True
+        return False
+
+    def _state(self):
+        return self.mode
+
+    def _current_path(self):
+        return self.path if self.mode != "stopped" else None
+
+    def _position(self):
+        return self.pos if self.control and self.mode != "stopped" else None
+
+    def _seek(self, seconds):
+        if self.control and self.mode != "stopped":
+            self.pos = seconds
+            return True
+        return False
+
+    def _can_control(self):
+        return self.control
+
+    def _is_playing(self):
+        return self.mode == "playing"
+
+
+def _ready_window(models=None):
+    win, _ = _make_window(models=models or _RecordingModels())
+    win.txt_vd_instruct.setPlainText("Warm narrator")
+    win.btn_vd_generate.click()
+    _wait_idle(win)
+    assert win.vd_preview.currentIndex() == PV_READY
+    return win
+
+
+def _test_sample_text_provenance_and_editing():
+    with _Patched():
+        models = _RecordingModels(seconds=1)
+        win = _ready_window(models)
+        # the voice said the standard passage, and the Preview shows exactly that
+        assert models.texts == [voice_library.SAMPLE_TEXT]
+        assert win.pending_voice["text"] == voice_library.SAMPLE_TEXT
+        assert win.txt_vd_spoken.toPlainText() == voice_library.SAMPLE_TEXT
+        assert win.txt_vd_spoken.isReadOnly() and win.txt_vd_spoken.accessibleName()
+        assert win.lbl_vd_spoken_note.text() == "Text used for this sample"
+        assert win.txt_vd_sample.toPlainText() == voice_library.SAMPLE_TEXT and not win.txt_vd_sample.isReadOnly()
+        # editing the field never edits the existing sample; it says the text differs
+        win.txt_vd_sample.setPlainText("Hello there. It's a beautiful day.")
+        assert win.txt_vd_spoken.toPlainText() == voice_library.SAMPLE_TEXT
+        assert not win.frm_vd_stale.isHidden() and "sample text" in win.lbl_vd_stale.text()
+        assert "has changed" in win.lbl_vd_spoken_note.text()
+        assert win.btn_vd_save.text() == "Save previous sample"
+        # Regenerate speaks the new text and the Preview follows it
+        win.btn_vd_regenerate.click()
+        _wait_idle(win)
+        assert models.texts[-1] == "Hello there. It's a beautiful day."
+        assert win.txt_vd_spoken.toPlainText() == "Hello there. It's a beautiful day."
+        assert win.frm_vd_stale.isHidden() and win.btn_vd_save.text() == "Save"
+        # the standard text can be restored
+        win.btn_vd_reset_text.click()
+        assert win.txt_vd_sample.toPlainText() == voice_library.SAMPLE_TEXT and not win.frm_vd_stale.isHidden()
+        # Edit text focuses the field, which lives in the main form (not in Advanced settings)
+        win.show()
+        assert not win.vd_advanced.isAncestorOf(win.txt_vd_sample) and win.vd_advanced.isHidden()
+        win.btn_vd_edit_text.click()
+        _app.processEvents()
+        assert win.txt_vd_sample.hasFocus() and win.vd_advanced.isHidden()
+        # blank text can't be generated
+        win.txt_vd_sample.setPlainText("   ")
+        before = len(models.texts)
+        win.btn_vd_generate.click()
+        _app.processEvents()
+        assert len(models.texts) == before and "sample text" in win.lbl_status.text().lower()
+        assert not win.busy and win.txt_vd_sample.hasFocus()
+        win.close()
+    print("PASS: spoken text provenance, editing for the next sample only, differs note, edit/reset, blank blocked")
+
+
+def _test_saved_voice_and_download_use_the_spoken_text():
+    with _Patched():
+        root = tempfile.mkdtemp()
+        original = voice_library.VOICES_DIR
+        voice_library.VOICES_DIR = root
+        real_dialog = QtWidgets.QFileDialog.getSaveFileName
+        try:
+            models = _RecordingModels(seconds=1)
+            win, _ = _make_window(models=models)
+            win.txt_vd_instruct.setPlainText("Warm narrator")
+            win.txt_vd_sample.setPlainText("Custom words for this voice.")
+            win.btn_vd_generate.click()
+            _wait_idle(win)
+            # editing the field afterwards must not change what Save records: the audio says the old words
+            win.txt_vd_sample.setPlainText("Different words that were never spoken.")
+            win.edt_vd_name.setText("Ada")
+            win.btn_vd_save.click()
+            _wait_idle(win)
+            with open(os.path.join(root, "Ada", "voice.json"), encoding="utf-8") as f:
+                config = json.load(f)
+            assert config["sample_text"] == config["ref_text"] == "Custom words for this voice.", config
+            assert models.ref_texts == ["Custom words for this voice."]
+            assert set(config) >= {"schema", "name", "created", "language", "description", "seed", "sample_text",
+                                   "ref_text", "ref_audio", "clone_prompt", "sample_rate", "models", "usage"}
+            # Download exports the same audio the Preview plays
+            target = os.path.join(root, "export.wav")
+            QtWidgets.QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (target, ""))
+            win.btn_vd_download.click()
+            exported, sr = load_wav(target)
+            assert sr == 24000 and len(exported) == len(np.asarray(win.pending_voice["wav"]).reshape(-1))
+        finally:
+            QtWidgets.QFileDialog.getSaveFileName = real_dialog
+            voice_library.VOICES_DIR = original
+    print("PASS: Save records the text actually spoken (not later edits); Download exports the previewed audio")
+
+
+def _test_preview_player_play_pause_resume_seek_stop_and_end():
+    with _Patched(), _FakeAudio(duration=20.0) as audio:
+        win = _ready_window(_RecordingModels(seconds=20))
+        path = win.pending_voice["preview"]
+        assert audio.play_calls == [(path, 0.0)], audio.play_calls
+        win._refresh_player()
+        assert win.btn_vd_play.text() == "Pause" and win.lbl_vd_total.text() == "0:20"
+        assert win.sld_vd_seek.maximum() == 20000 and win.sld_vd_seek.isEnabled()
+        # time and position are the player's own, not invented
+        audio.advance(7.0)
+        win._refresh_player()
+        assert win.lbl_vd_time.text() == "0:07" and win.sld_vd_seek.value() == 7000
+        # Play/Pause is one toggle: pause keeps the position, resume does not restart
+        win.btn_vd_play.click()
+        assert audio.mode == "paused" and win.btn_vd_play.text() == "Play" and win.lbl_vd_time.text() == "0:07"
+        audio.advance(3.0)
+        assert audio.pos == 7.0
+        win.btn_vd_play.click()
+        assert audio.mode == "playing" and len(audio.play_calls) == 1, "resume must not restart playback"
+        assert win.btn_vd_play.text() == "Pause" and win.lbl_vd_time.text() == "0:07"
+        # seeking: slider (keyboard), waveform click, back and forward
+        win.sld_vd_seek.setValue(12000)
+        assert audio.pos == 12.0 and win.lbl_vd_time.text() == "0:12"
+        win.vd_wave.seek_requested.emit(0.25)
+        assert audio.pos == 5.0
+        win.btn_vd_forward.click()
+        assert audio.pos == 10.0
+        win.btn_vd_back.click()
+        win.btn_vd_back.click()
+        win.btn_vd_back.click()
+        assert audio.pos == 0.0, "back stops at the start"
+        win._seek_preview(999)
+        assert audio.pos < 20.0 and audio.mode == "playing"
+        # the playhead follows the position
+        win._seek_preview(10.0)
+        assert abs(win.vd_wave._progress - 0.5) < 1e-6
+        # footer Stop audio resets the Preview to the start
+        win._refresh_audio_state()
+        assert not win.btn_stop_audio.isHidden()
+        win.btn_stop_audio.click()
+        assert audio.mode == "stopped" and win.btn_vd_play.text() == "Play" and win.lbl_vd_time.text() == "0:00"
+        assert win.vd_wave._progress is None and win.btn_stop_audio.isHidden()
+        # seeking while stopped sets where Play starts
+        win._seek_preview(6.0)
+        assert audio.mode == "stopped" and win.lbl_vd_time.text() == "0:06"
+        win.btn_vd_play.click()
+        assert audio.play_calls[-1] == (path, 6.0) and audio.mode == "playing"
+        # played to the end: back to Play at 0:00, and Play starts from the beginning
+        audio.advance(100)
+        win._refresh_player()
+        assert win.btn_vd_play.text() == "Play" and win.lbl_vd_time.text() == "0:00" and win.sld_vd_seek.value() == 0
+        win.btn_vd_play.click()
+        assert audio.play_calls[-1] == (path, 0.0)
+        win.close()
+    print("PASS: Play/Pause toggles and resumes, real position/duration, seek, stop, ended state")
+
+
+def _test_preview_player_stays_consistent_with_other_audio_and_pages():
+    with _Patched(), _FakeAudio(duration=20.0) as audio:
+        win = _ready_window(_RecordingModels(seconds=20))
+        audio.advance(4.0)
+        win.show_page(2)                       # leave Create Voice while it plays
+        audio.advance(2.0)
+        win._refresh_audio_state()
+        assert not win.btn_stop_audio.isHidden(), "Stop audio stays available on other pages"
+        win.show_page(0)
+        win._refresh_player()
+        assert win.btn_vd_play.text() == "Pause" and win.lbl_vd_time.text() == "0:06"
+        # different audio starts elsewhere: the Preview is not playing, so it never claims to be
+        audio._play("/somewhere/else.wav")
+        win._refresh_player()
+        assert win.btn_vd_play.text() == "Play"
+        win.btn_vd_play.click()
+        assert audio.path == win.pending_voice["preview"] and len(audio.play_calls) == 3
+        # paused audio can still be stopped from the footer
+        win.btn_vd_play.click()
+        win._refresh_audio_state()
+        assert audio.mode == "paused" and not win.btn_stop_audio.isHidden()
+        # regenerating stops playback before the new sample arrives, so nothing overlaps
+        win.btn_vd_regenerate.click()
+        assert audio.mode == "stopped"
+        _wait_idle(win)
+        win.close()
+    print("PASS: Preview and footer share one playback state across pages and other audio")
+
+
+def _test_preview_player_without_pause_support_and_playback_errors():
+    with _Patched(), _FakeAudio(duration=20.0, control=False) as audio:
+        win = _ready_window(_RecordingModels(seconds=20))
+        win._refresh_player()
+        assert win.btn_vd_play.text() == "Stop", "a backend that can't pause offers Stop, not a fake Pause"
+        assert not win.sld_vd_seek.isEnabled() and not win.btn_vd_back.isEnabled() and win.lbl_vd_time.text() == "–"
+        win.btn_vd_play.click()
+        assert audio.mode == "stopped" and win.btn_vd_play.text() == "Play"
+        audio.fail = "No audio player found"
+        win.btn_vd_play.click()
+        assert "Couldn't play the sample" in win.lbl_vd_notice.text()
+        assert win.lbl_status.text().startswith("Playback error") and win.btn_vd_play.text() == "Play"
+        win.close()
+    print("PASS: no-pause backends offer Stop and no seek; playback errors are reported and recoverable")
+
+
+def _test_audio_player_position_pause_and_seek_over_pygame_clock():
+    import types
+    clock = {"t": 0.0}
+
+    class Music:
+        def __init__(self):
+            self.playing, self.paused, self.t0, self.pos = False, False, 0.0, 0.0
+
+        def _played(self):
+            return self.pos + (0 if self.paused or not self.playing else clock["t"] - self.t0)
+
+        def load(self, path): self.loaded = path
+        def play(self): self.playing, self.paused, self.t0, self.pos = True, False, clock["t"], 0.0
+        def pause(self): self.pos, self.paused = self._played(), True
+        def unpause(self): self.paused, self.t0 = False, clock["t"]
+        def stop(self): self.playing, self.paused = False, False
+        def get_busy(self): return self.playing and not self.paused and self._played() < 10
+        def get_pos(self): return int(self._played() * 1000) if self.playing else -1
+        def set_pos(self, seconds): self.seek_to = seconds   # pygame's own clock keeps counting
+
+    music = Music()
+    fake = types.SimpleNamespace(mixer=types.SimpleNamespace(get_init=lambda: True, init=lambda: None, music=music))
+    real = sys.modules.get("pygame")
+    sys.modules["pygame"] = fake
+    try:
+        audio_player.stop()
+        audio_player.play("a.wav")
+        assert audio_player.state() == "playing" and audio_player.current_path() == "a.wav"
+        clock["t"] = 2.0
+        assert abs(audio_player.position() - 2.0) < 1e-6
+        assert audio_player.pause() and audio_player.state() == "paused" and audio_player.current_path() == "a.wav"
+        clock["t"] = 5.0
+        assert abs(audio_player.position() - 2.0) < 1e-6, "paused time does not advance"
+        assert audio_player.resume() and audio_player.state() == "playing"
+        clock["t"] = 6.0
+        assert abs(audio_player.position() - 3.0) < 1e-6
+        assert audio_player.seek(8.0) and music.seek_to == 8.0
+        assert abs(audio_player.position() - 8.0) < 1e-6
+        clock["t"] = 7.0
+        assert abs(audio_player.position() - 9.0) < 1e-6, "position continues from the seek target"
+        clock["t"] = 20.0
+        assert audio_player.state() == "stopped" and audio_player.position() is None and audio_player.current_path() is None
+        audio_player.play("b.wav", start=4.0)
+        assert music.seek_to == 4.0 and abs(audio_player.position() - 4.0) < 1e-6
+        audio_player.stop()
+        assert audio_player.state() == "stopped" and not audio_player.seek(1.0) and not audio_player.pause()
+    finally:
+        audio_player.stop()
+        if real is not None:
+            sys.modules["pygame"] = real
+        else:
+            del sys.modules["pygame"]
+    print("PASS: audio_player reports real position across pause, resume and seek, and the ended state")
+
+
+def _test_preview_player_keyboard_focus_and_minimum_size_layout():
+    with _Patched(), _FakeAudio(duration=20.0) as audio:
+        win = _ready_window(_RecordingModels(seconds=20))
+        win.resize(1024, 640)
+        win.show()
+        _app.processEvents()
+        page = win.stack.widget(0)
+        assert page.horizontalScrollBar().maximum() == 0, "no horizontal scrolling at 1024x640"
+        order = [win.txt_vd_spoken, win.btn_vd_edit_text, win.sld_vd_seek, win.btn_vd_back, win.btn_vd_play,
+                 win.btn_vd_forward, win.edt_vd_name]
+        win.txt_vd_spoken.setFocus()
+        seen = []
+        for _ in range(len(order) - 1):
+            win.focusNextChild()
+            seen.append(QtWidgets.QApplication.focusWidget())
+        assert seen == order[1:], [w.accessibleName() or w.text() for w in seen if w]
+        assert win.sld_vd_seek.accessibleName() == "Seek" and win.btn_vd_back.accessibleName() == "Back 5 seconds"
+        assert win.btn_vd_forward.accessibleName() == "Forward 5 seconds"
+        assert "of 0:20" in win.sld_vd_seek.accessibleDescription()
+        # the slider is keyboard operable
+        win.sld_vd_seek.setFocus()
+        audio.pos = 0.0
+        QTest.keyClick(win.sld_vd_seek, QtCore.Qt.Key_Right)
+        assert audio.pos == 5.0, audio.pos
+        win.close()
+    print("PASS: player keyboard order, accessible names and slider keys; no horizontal scroll at 1024x640")
+
+
+def _test_sample_text_is_a_first_class_field_in_the_main_form():
+    with _Patched():
+        models = _RecordingModels(seconds=1)
+        win, _ = _make_window(models=models)
+        # one editor only, in the main form between the description and Generate
+        editors = [w for w in win.findChildren(QtWidgets.QPlainTextEdit) if w.accessibleName() == "Sample text"]
+        assert editors == [win.txt_vd_sample], "exactly one Sample text editor"
+        assert not win.vd_advanced.isAncestorOf(win.txt_vd_sample) and not win.vd_advanced.isAncestorOf(win.btn_vd_reset_text)
+        assert win.txt_vd_sample.toPlainText() == voice_library.SAMPLE_TEXT
+        for size in ((1240, 780), (1024, 640)):
+            win.resize(*size)
+            win.show()
+            _app.processEvents()
+            page = win.stack.widget(0)
+            viewport = page.viewport()
+            for w in (win.txt_vd_instruct, win.txt_vd_sample, win.btn_vd_reset_text, win.btn_vd_generate):
+                top = w.mapTo(viewport, QtCore.QPoint(0, 0)).y()
+                assert top >= 0 and top + w.height() <= viewport.height(), (size, w.accessibleName() or w.text(), top)
+            ys = [w.mapTo(win.vd_content, QtCore.QPoint(0, 0)).y() for w in (
+                win.txt_vd_instruct, win.txt_vd_sample, win.btn_vd_generate)]
+            assert ys == sorted(ys), "order: description, sample text, Generate"
+            assert page.horizontalScrollBar().maximum() == 0
+        # reset restores the passage without generating
+        win.txt_vd_sample.setPlainText("Something else.")
+        win.btn_vd_reset_text.click()
+        assert win.txt_vd_sample.toPlainText() == voice_library.SAMPLE_TEXT and not models.texts and not win.busy
+        # either input makes an existing sample potentially outdated; the audio and its text stay as they were
+        win.btn_vd_generate.click()
+        _wait_idle(win)
+        assert win.frm_vd_stale.isHidden()
+        win.txt_vd_instruct.setPlainText("A different voice")
+        assert not win.frm_vd_stale.isHidden()
+        win.txt_vd_instruct.setPlainText("Warm, gentle female voice, calm and soothing tone.")
+        assert win.frm_vd_stale.isHidden()
+        win.txt_vd_sample.setPlainText("New words.")
+        assert not win.frm_vd_stale.isHidden() and win.txt_vd_spoken.toPlainText() == voice_library.SAMPLE_TEXT
+        assert win.pending_voice["text"] == voice_library.SAMPLE_TEXT
+        win.close()
+    print("PASS: Sample text is one editor in the main form, visible with Generate at 1240x780 and 1024x640; reset and stale behaviour")
+
+
+def _test_create_voice_final_layout_flat_reader_scrollbars_and_contextual_origin():
+    with _Patched():
+        win = _ready_window(_RecordingModels(seconds=1))
+        win.txt_vd_sample.setPlainText("A long passage. " * 120)   # long Sample text
+        for size in ((1240, 780), (1024, 640)):
+            win.resize(*size)
+            win.show()
+            _app.processEvents()
+            page = win.stack.widget(0)
+            assert page.horizontalScrollBar().maximum() == 0, f"horizontal scrolling at {size}"
+            left_edge = win.txt_vd_instruct.mapTo(win.vd_content, QtCore.QPoint(0, 0)).x()
+            right_edge = left_edge + win.txt_vd_instruct.width()
+            for w in (win.lbl_vd_model, win.cmb_vd_lang, win.btn_vd_advanced):
+                x = w.mapTo(win.vd_content, QtCore.QPoint(0, 0)).x()
+                assert left_edge <= x and x + w.width() <= right_edge + 1, (size, w, x, w.width())
+                assert w.mapTo(win.vd_content, QtCore.QPoint(0, 0)).y() > win.btn_vd_generate.mapTo(
+                    win.vd_content, QtCore.QPoint(0, 0)).y(), "options sit beneath Generate voice"
+            preview_left = win.preview_panel.mapTo(win.vd_content, QtCore.QPoint(0, 0)).x()
+            assert right_edge < preview_left, "form column and Preview do not overlap"
+            win.btn_vd_advanced.setChecked(True)
+            _app.processEvents()
+            assert page.horizontalScrollBar().maximum() == 0, f"Advanced settings overflow at {size}"
+            for w in (win.cmb_vd_seed_mode, win.chk_vd_autosave, win.btn_vd_rand_name):
+                x = w.mapTo(win.vd_content, QtCore.QPoint(0, 0)).x()
+                assert x + w.width() <= right_edge + 1, (size, w.text() if hasattr(w, "text") else w, x + w.width(), right_edge)
+            win.btn_vd_advanced.setChecked(False)
+        # the Preview text is a flat reader (selectable, scrollable, focusable), about three lines tall
+        reader = win.txt_vd_spoken
+        assert reader.property("role") == "reader" and reader.isReadOnly()
+        assert reader.height() <= reader.fontMetrics().lineSpacing() * 3 + 12
+        assert reader.textInteractionFlags() & QtCore.Qt.TextSelectableByKeyboard
+        assert reader.focusPolicy() & QtCore.Qt.TabFocus
+        assert win.txt_vd_sample.property("role") != "reader", "only the form field looks like an input"
+        reader.setFocus()
+        assert reader.verticalScrollBar().maximum() > 0, "the full passage is longer than the three visible lines"
+        for _ in range(4):
+            QTest.keyClick(reader, QtCore.Qt.Key_Down)   # the keyboard scrolls the reader
+        assert reader.verticalScrollBar().value() > 0
+        QTest.keyClick(reader, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
+        assert reader.textCursor().hasSelection()
+        assert reader.toPlainText() == voice_library.SAMPLE_TEXT, "the long form text never replaces the audio's text"
+        # scrollbars are themed: compact, no arrow buttons
+        sheet = QtWidgets.QApplication.instance().styleSheet()
+        assert "QScrollBar::add-line" in sheet and "QScrollBar:vertical" in sheet
+        # origin metadata is reachable but only shown inline when the sample is out of date
+        assert win.lbl_vd_origin.isHidden() is False or True
+        assert not win.frm_vd_stale.isHidden() and not win.lbl_vd_origin.isHidden()
+        assert "Warm narrator" in win.lbl_vd_preview_title.toolTip() and "Warm narrator" in reader.accessibleDescription()
+        win.txt_vd_sample.setPlainText(voice_library.SAMPLE_TEXT)
+        assert win.frm_vd_stale.isHidden() and win.lbl_vd_origin.isHidden()
+        win.close()
+    print("PASS: options under the form column, flat selectable reader, themed scrollbars, contextual origin, no overflow")
+
+
+def _test_loading_ui_shows_real_elapsed_time_in_plain_wording():
+    with _Patched():
+        slow = _SlowModels()
+        win, _ = _make_window(models=slow)
+        win.resize(1024, 640)
+        _shown(win)
+        real = qt_app.time.monotonic
+        clock = {"t": 1000.0}
+        qt_app.time.monotonic = lambda: clock["t"]
+        try:
+            win.btn_vd_generate.click()
+            for _ in range(20):
+                _app.processEvents()
+                time.sleep(0.02)
+            assert win.gen_timer.isActive() and win.lbl_vd_elapsed.text() == "0:00 elapsed"
+            clock["t"] += 125
+            win._tick_elapsed()
+            assert win.lbl_vd_elapsed.text() == "2:05 elapsed", "elapsed is the measured clock, not an estimate"
+            text = " ".join([win.lbl_vd_busy.text(), win.lbl_vd_busy_hint.text(), win.lbl_vd_elapsed.text()])
+            assert "%" not in text and "remaining" not in text.lower() and "left" not in text.lower()
+            assert win.lbl_vd_busy_hint.text() == qt_app.LOADING_HINT, "plain wording, no technical explanation"
+            assert win.vd_busy_bar.indeterminate and win.progress.maximum() == 1 and win.btn_stop.isHidden(), \
+                "one indeterminate bar, and no Cancel: the model call cannot be interrupted"
+            slow.release.set()
+            _wait_idle(win)
+            assert not win.gen_timer.isActive() and win._gen_t0 is None, "the clock stops with the generation"
+            # a regeneration over an existing sample reports elapsed time in its notice, then clears it
+            slow.release.clear()
+            win.models = slow
+            win.btn_vd_regenerate.click()
+            for _ in range(20):
+                _app.processEvents()
+                time.sleep(0.02)
+            clock["t"] += 61
+            win._tick_elapsed()
+            assert "1:01 elapsed" in win.lbl_vd_notice.text() and "current sample stays available" in win.lbl_vd_notice.text()
+            slow.release.set()
+            _wait_idle(win)
+            assert not win.gen_timer.isActive()
+            # failure stops the clock too
+            win.models = _StubModels()
+            win.btn_vd_regenerate.click()
+            _wait_idle(win)
+            assert not win.gen_timer.isActive() and win._gen_t0 is None
+        finally:
+            qt_app.time.monotonic = real
+            slow.release.set()
+        win.close()
+    print("PASS: loading shows a real elapsed clock in plain wording; no percentage, ETA or Cancel; clock stops")
+
+
+def _test_footer_stop_audio_is_contextual_and_does_not_shift_the_footer():
+    with _Patched(), _FakeAudio(duration=20.0) as audio:
+        win = _ready_window(_RecordingModels(seconds=20))
+        win.resize(1240, 780)
+        win.show()
+        _app.processEvents()
+        audio._stop()
+        win._refresh_audio_state()
+        assert win.btn_stop_audio.isHidden(), "idle: no Stop audio"
+        x_open = win.btn_open_out.geometry().x()
+        # playing (the Preview's own audio), paused, stopped, ended, and audio from another page
+        audio._play(win.pending_voice["preview"])
+        win._refresh_audio_state()
+        assert not win.btn_stop_audio.isHidden() and win.btn_open_out.geometry().x() == x_open, "no footer shift"
+        audio._pause()
+        win._refresh_audio_state()
+        assert not win.btn_stop_audio.isHidden(), "paused audio can still be stopped"
+        win.btn_stop_audio.click()
+        assert win.btn_stop_audio.isHidden() and audio.mode == "stopped"
+        audio._play(win.pending_voice["preview"])
+        win._refresh_audio_state()
+        audio.advance(100)                          # played to the end
+        win._refresh_audio_state()
+        assert win.btn_stop_audio.isHidden(), "ended: hidden again"
+        win.show_page(2)
+        audio._play("/voices/ada/reference.wav")    # My Voices playback keeps the global stop
+        win._refresh_audio_state()
+        assert not win.btn_stop_audio.isHidden() and win.btn_open_out.geometry().x() == x_open
+        # a hidden control is not a Tab stop; Open output folder stays neutral and always present
+        audio._stop()
+        win._refresh_audio_state()
+        assert win.btn_stop_audio.isHidden() and not win.btn_open_out.isHidden()
+        win.btn_play_last.setFocus() if not win.btn_play_last.isHidden() else win.nav_buttons[2].setFocus()
+        seen = []
+        for _ in range(40):
+            win.focusNextChild()
+            seen.append(QtWidgets.QApplication.focusWidget())
+        assert win.btn_stop_audio not in seen
+        win.close()
+    print("PASS: Stop audio shows only for a playback session (playing/paused, any page), hides otherwise, no footer shift or hidden tab stop")
+
+
+def _test_leaving_a_navigation_item_never_leaves_its_focus_ring_behind():
+    with _Patched():
+        win, _ = _make_window()
+        win.resize(1024, 640)
+        win.show()
+        win.activateWindow()
+        _app.processEvents()
+        settings = win.nav_buttons[-1]
+        for how in ("shortcut", "mouse"):
+            win.show_page(0)
+            win.nav_buttons[0].setFocus()
+            for _ in range(4):
+                QTest.keyClick(win.windowHandle(), QtCore.Qt.Key_Down)   # arrows move between items
+            _app.processEvents()
+            assert win.stack.currentIndex() == 4 and win.focusWidget() is settings
+            if how == "shortcut":
+                QTest.keyClick(win.windowHandle(), QtCore.Qt.Key_1, QtCore.Qt.ControlModifier)
+            else:
+                QTest.mouseClick(win.nav_buttons[0], QtCore.Qt.LeftButton)
+            _app.processEvents()
+            assert win.stack.currentIndex() == 0
+            assert not settings.hasFocus() and win.focusWidget() is win.nav_buttons[0], (how, win.focusWidget())
+        # a mouse user never gets a ring on Settings, and a keyboard user keeps a visible ring on the selected item
+        win.show_page(0)
+        QTest.mouseClick(settings, QtCore.Qt.LeftButton)
+        QTest.mouseClick(win.nav_buttons[0], QtCore.Qt.LeftButton)
+        _app.processEvents()
+        assert not settings.hasFocus()
+        win.close()
+    print("PASS: keyboard focus follows the selected navigation item; Settings keeps no stray focus ring")
+
+
+def _test_activity_bar_is_one_restrained_segment_that_only_runs_while_visible():
+    bar = qt_app.ActivityBar()
+    bar.resize(300, 4)
+    assert bar.indeterminate and bar.accessibleName() and not hasattr(bar, "value"), "no value, so no fake percentage"
+    assert bar._anim.state() == QtCore.QAbstractAnimation.Stopped, "idle until shown"
+    bar.show()
+    _app.processEvents()
+    assert bar._anim.state() == QtCore.QAbstractAnimation.Running
+    accent = QtGui.QColor(theme.COLORS["accent"]).name().upper()
+    for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+        bar._t = t
+        image = bar.grab().toImage()
+        runs, inside = 0, False
+        for x in range(image.width()):
+            lit = image.pixelColor(x, 2).name().upper() == accent
+            runs += lit and not inside
+            inside = lit
+        assert runs == 1, f"exactly one segment at t={t}, found {runs}"
+    bar.hide()
+    assert bar._anim.state() == QtCore.QAbstractAnimation.Stopped, "no animation (or CPU) while hidden"
+    print("PASS: the activity indicator is a single gliding segment with no value, running only while visible")
+
+
+def _test_navigation_ring_follows_keyboard_focus_only():
+    with _Patched():
+        win, _ = _make_window()
+        win.resize(1024, 640)
+        win.show()
+        win.activateWindow()
+        _app.processEvents()
+        accent = QtGui.QColor(theme.COLORS["accent"]).name().upper()
+
+        def ring(button):
+            _app.processEvents()
+            image = button.grab().toImage()
+            edge = [image.pixelColor(x, y).name().upper() for x in (1, image.width() - 2) for y in range(8, image.height() - 8)]
+            edge += [image.pixelColor(x, y).name().upper() for y in (1, image.height() - 2) for x in range(8, image.width() - 8)]
+            return accent in edge
+
+        for index in (0, 2, 4):                      # any selected page, with and without focus
+            win.show_page(index)
+            win.nav_buttons[index].clearFocus()
+            win.setFocus()
+            _app.processEvents()
+            assert not win.nav_buttons[index].hasFocus()
+            assert not ring(win.nav_buttons[index]), f"selected item {index} must not show a ring without focus"
+            win.nav_buttons[index].setFocus(QtCore.Qt.TabFocusReason)
+            assert ring(win.nav_buttons[index]), f"keyboard focus on item {index} shows the ring"
+        for index in range(5):
+            if index != win.stack.currentIndex():
+                assert not ring(win.nav_buttons[index]), "unselected, unfocused items never show a ring"
+        # moving the selection moves the ring with the keyboard focus; no other item keeps one
+        win.show_page(0)
+        assert win.focusWidget() is win.nav_buttons[0] and ring(win.nav_buttons[0])
+        assert not any(ring(b) for b in win.nav_buttons[1:])
+        QTest.mouseClick(win.nav_buttons[4], QtCore.Qt.LeftButton)   # a mouse click selects without a ring on Settings
+        win.nav_buttons[0].clearFocus()
+        win.setFocus()
+        assert not ring(win.nav_buttons[4])
+        win.close()
+    print("PASS: the navigation ring appears only for keyboard focus, never for selection alone, and never stays on a deselected item")
+
+
 def _page_contains(stack, widget):
     return stack.currentWidget().isAncestorOf(widget)
 
@@ -244,7 +896,7 @@ def _test_empty_preview_is_compact_and_has_no_audio_controls():
     assert win.preview_panel.property("empty") is True
     for w in (win.btn_vd_play, win.btn_vd_save, win.btn_vd_download, win.btn_vd_regenerate, win.vd_wave):
         assert not _page_contains(win.vd_preview, w), "audio actions must not show before audio exists"
-    assert win.lbl_vd_duration.isHidden()
+    assert not _page_contains(win.vd_preview, win.lbl_vd_total)
     win.show()
     _app.processEvents()
     assert win.preview_panel.height() < 160, win.preview_panel.height()
@@ -267,11 +919,14 @@ def _test_previous_sample_stays_available_while_regenerating():
         assert win.busy
         assert win.vd_preview.currentIndex() == PV_READY, "previous sample must stay visible"
         assert win.btn_vd_play.isEnabled() and not win.btn_vd_regenerate.isEnabled()
-        assert "Generating a new sample" in win.lbl_vd_notice.text()
+        assert "Loading the voice model" in win.lbl_vd_notice.text() and "previous" not in win.lbl_vd_notice.text().lower() \
+            and "current sample stays available" in win.lbl_vd_notice.text()
+        assert not win.vd_regen_bar.isHidden() and win.progress.maximum() == 1, "one indicator: in the Preview, none in the footer"
+        assert win.lbl_status.text() == qt_app.FOOTER_CREATING
         assert win.pending_voice["preview"] == first_preview
         slow.release.set()
         _wait_idle(win)
-        assert win.vd_preview.currentIndex() == PV_READY and win.lbl_vd_notice.isHidden()
+        assert win.vd_preview.currentIndex() == PV_READY and win.lbl_vd_notice.isHidden() and win.vd_regen_bar.isHidden()
     print("PASS: previous sample stays visible and playable while a new one generates")
 
 
@@ -337,15 +992,24 @@ def _test_my_voices_empty_state():
     voice_library.VOICES_DIR = tempfile.mkdtemp()
     try:
         win, _ = _make_window()
-        assert not win.lbl_voices_empty.isHidden()
+        win.show_page(PAGE_VOICES)
+        _shown(win)
+        assert not win.frm_voices_empty.isHidden() and win.lst_voices.isHidden(), "empty library shows the explanation, not a blank list"
+        assert win.frm_voice_actions.isHidden() and win.lbl_voice_count.text() == ""
+        assert win.btn_voice_refresh.isVisible() and win.btn_voice_import.isVisible()
+        win.btn_voice_go_create.click()
+        assert win.stack.currentIndex() == 0, "the empty state leads to Create Voice"
         os.makedirs(os.path.join(voice_library.VOICES_DIR, "Ada"))
         with open(os.path.join(voice_library.VOICES_DIR, "Ada", "voice.json"), "w") as f:
             f.write('{"name": "Ada", "description": "d", "language": "english", "seed": 1, "created": "x"}')
+        win.show_page(PAGE_VOICES)
         win.refresh_voices_tab()
-        assert win.lbl_voices_empty.isHidden()
+        assert win.frm_voices_empty.isHidden() and not win.lst_voices.isHidden() and not win.frm_voice_actions.isHidden()
+        assert win.lbl_voice_count.text() == "1 voice"
+        win.close()
     finally:
         voice_library.VOICES_DIR = original
-    print("PASS: My Voices shows an empty-state hint only when there are no voices")
+    print("PASS: My Voices shows a real empty state (no blank list) and the list once a voice exists")
 
 
 def _with_voices(names):
@@ -364,28 +1028,35 @@ def _with_voices(names):
 
 
 def _test_my_voices_actions_fit_at_1024_px():
-    for names in ([], ["Ada", "Brook", "Cleo"]):
+    for names, pick in (([], None), (["Ada", "Brook", "Cleo"], 1), ([f"V{i}" for i in range(30)], 2)):
         restore = _with_voices(names)
         try:
             win, _ = _make_window()
             win.resize(1024, 640)
             win.show_page(PAGE_VOICES)
             _shown(win)
+            win.resize(1024, 640)
+            _app.processEvents()
+            if pick is not None:
+                win.lst_voices.item(pick).setSelected(True)
             page = win.stack.currentWidget()
-            area = page.findChild(QtWidgets.QScrollArea)
-            assert area.horizontalScrollBar().maximum() == 0, "My Voices must not scroll sideways at 1024 px"
-            viewport = area.viewport().rect()
+            assert page.horizontalScrollBar().maximum() == 0, "My Voices must not scroll sideways at 1024 px"
+            assert page.verticalScrollBar().maximum() == 0, "My Voices must fit 1024 x 640 without page scrolling"
+            viewport = page.viewport().rect()
             for button in page.findChildren(QtWidgets.QPushButton):
-                if button.text() == "▶":
+                if not button.isVisible():
                     continue
-                top_left = button.mapTo(area.viewport(), QtCore.QPoint(0, 0))
+                top_left = button.mapTo(page.viewport(), QtCore.QPoint(0, 0))
                 assert viewport.contains(QtCore.QRect(top_left, button.size())), f"{button.text()!r} is clipped"
                 need = button.fontMetrics().horizontalAdvance(button.text()) + 24
                 assert button.width() >= need, f"{button.text()!r} is squeezed"
+            if names:
+                assert win.lst_voices.horizontalScrollBar().maximum() == 0 and not win.lst_voices.horizontalScrollBar().isVisible()
+                assert win.lst_voices.height() >= 180
             win.close()
         finally:
             restore()
-    print("PASS: every My Voices action is visible at 1024 px, with and without voices")
+    print("PASS: every My Voices control is visible at 1024 x 640 with 0, 3 and 30 voices; no sideways scrolling")
 
 
 def _test_engine_references_require_exactly_one_voice():
@@ -397,11 +1068,11 @@ def _test_engine_references_require_exactly_one_voice():
         _shown(win)
         button = win.btn_voice_engine_refs
         assert not button.isEnabled() and "exactly one" in button.toolTip()
-        win.tv_voices.selectRow(0)
+        win.lst_voices.item(0).setSelected(True)
         assert button.isEnabled()
-        win.tv_voices.selectAll()
+        win.lst_voices.selectAll()
         assert not button.isEnabled(), "two selected voices must disable the engine references"
-        win.tv_voices.clearSelection()
+        win.lst_voices.clearSelection()
         assert not button.isEnabled()
         # The old handlers keep their own error fallback when called without a selection.
         win.edit_csm_transcript()
@@ -424,7 +1095,7 @@ def _test_engine_references_menu_works_from_the_keyboard():
         win.resize(1024, 640)
         win.show_page(PAGE_VOICES)
         _shown(win)
-        win.tv_voices.selectRow(0)
+        win.lst_voices.item(0).setSelected(True)
         calls = []
         win.act_voice_transcript.triggered.disconnect()
         win.act_voice_f5.triggered.disconnect()
@@ -462,23 +1133,560 @@ def _test_my_voices_tab_order():
         win.resize(1024, 640)
         win.show_page(PAGE_VOICES)
         _shown(win)
-        win.tv_voices.selectRow(0)
-        page = win.stack.currentWidget()
-        first = next(b for b in page.findChildren(QtWidgets.QPushButton) if b.text() == "Import voice…")
+        win.lst_voices.item(0).setSelected(True)
+        win.lst_voices.setCurrentRow(0, QtCore.QItemSelectionModel.NoUpdate)
+        first = win.btn_voice_import
         first.setFocus()
         _app.processEvents()
-        seen = [first.text()]
+
+        def label(widget):
+            return "voice list" if widget is win.lst_voices else getattr(widget, "text", lambda: "?")()
+
+        seen = [label(first)]
         for _ in range(7):
             QTest.keyClick(win.focusWidget(), QtCore.Qt.Key_Tab)
             _app.processEvents()
-            seen.append(getattr(win.focusWidget(), "text", lambda: "?")())
-        expected = ["Import voice…", "Create from audio…", "Refresh / Detect", "▶ Play reference",
-                    "Rename selected", "Delete selected", "Engine references"]
-        assert seen[:7] == expected, seen
+            seen.append(label(win.focusWidget()))
+        expected = ["Import voice…", "Create from audio…", "Refresh", "voice list", "Play reference",
+                    "Rename", "Delete", "Engine references"]
+        assert seen == expected, seen
         win.close()
     finally:
         restore()
-    print("PASS: My Voices Tab order is library actions, then selected-voice actions")
+    print("PASS: My Voices Tab order is header actions, refresh, the list, then the selected-voice actions")
+
+
+def _voices_window(names, size=(1024, 640)):
+    restore = _with_voices(names)
+    win, _ = _make_window()
+    win.resize(*size)
+    win.show_page(PAGE_VOICES)
+    _shown(win)
+    win.resize(*size)
+    _app.processEvents()
+    return win, restore
+
+
+def _test_my_voices_rows_show_name_description_and_formatted_metadata():
+    restore = _with_voices([])
+    try:
+        root = voice_library.VOICES_DIR
+        for slug, cfg in {
+            "Ada": {"name": "Ada Lovelace", "description": "Warm narrator", "language": "english", "seed": 424242,
+                    "created": "2026-11-12T10:30:00"},
+            "Odd": {"name": "Odd", "description": "", "language": "", "seed": 7, "created": "not a date"},
+        }.items():
+            os.makedirs(os.path.join(root, slug))
+            with open(os.path.join(root, slug, "voice.json"), "w") as f:
+                json.dump(cfg, f)
+        win, _ = _make_window()
+        win.show_page(PAGE_VOICES)
+        _shown(win)
+        lst = win.lst_voices
+        assert lst.count() == 2
+        by_slug = {lst.item(i).data(voice_list.SLUG_ROLE): lst.item(i) for i in range(lst.count())}
+        ada = by_slug["Ada"]
+        assert ada.text() == "Ada Lovelace" and ada.data(voice_list.NAME_ROLE) == "Ada Lovelace"
+        meta = ada.data(QtCore.Qt.UserRole + 3)
+        assert meta.startswith("English · ") and "2026" in meta and "T10" not in meta, meta
+        assert ada.toolTip() == "Warm narrator"
+        accessible = ada.data(QtCore.Qt.AccessibleTextRole)
+        assert "Ada Lovelace" in accessible and "Warm narrator" in accessible and "English" in accessible, accessible
+        for item in by_slug.values():
+            assert "424242" not in item.data(QtCore.Qt.AccessibleTextRole) and "424242" not in (item.data(QtCore.Qt.UserRole + 3) or "")
+        assert by_slug["Odd"].data(QtCore.Qt.UserRole + 3) == "not a date", "an unparseable date is shown as stored"
+        # the technical metadata stays on disk and in the library API
+        details = {d["slug"]: d for d in voice_library.list_voice_details()}
+        assert details["Ada"]["seed"] == 424242
+        with open(os.path.join(root, "Ada", "voice.json")) as f:
+            assert json.load(f)["seed"] == 424242
+        win.close()
+    finally:
+        restore()
+    print("PASS: voice rows show name, description, language and a formatted date; seed is not in the list but stays stored")
+
+
+def _test_my_voices_selection_states_gate_the_actions():
+    win, restore = _voices_window(["Ada", "Brook", "Cleo"])
+    try:
+        play, rename, delete, refs = win.btn_voice_play, win.btn_voice_rename, win.btn_voice_delete, win.btn_voice_engine_refs
+        # nothing selected
+        assert win.lst_voices.selectedItems() == []
+        assert not any(b.isEnabled() for b in (play, rename, delete, refs))
+        assert win.lbl_voice_selection.text() == "No voice selected"
+        for b in (play, rename, refs):
+            assert "exactly one" in b.toolTip()
+        assert "Select one or more" in delete.toolTip()
+        # one voice
+        win.lst_voices.item(1).setSelected(True)
+        assert all(b.isEnabled() for b in (play, rename, delete, refs))
+        assert win.lbl_voice_selection.text() == "Brook"
+        assert play.accessibleName() == "Play reference for Brook" and rename.accessibleName() == "Rename Brook"
+        assert delete.accessibleName() == "Delete Brook"
+        assert play.accessibleName().startswith(play.text()), "the accessible name starts with the visible label"
+        # several voices: only delete stays available
+        win.lst_voices.selectAll()
+        assert delete.isEnabled() and not any(b.isEnabled() for b in (play, rename, refs))
+        assert win.lbl_voice_selection.text() == "3 voices selected"
+        assert delete.accessibleName() == "Delete 3 voices"
+        win.lst_voices.clearSelection()
+        assert not delete.isEnabled()
+        # the handlers keep their own fallback when called without exactly one voice
+        win.play_voice_tab()
+        assert "select exactly one voice to play" in win.lbl_status.text().lower()
+        win.rename_voice_tab()
+        assert "select exactly one voice to rename" in win.lbl_status.text().lower()
+        win.close()
+    finally:
+        restore()
+    print("PASS: play/rename/references need exactly one voice, delete needs at least one; the bar names the selection")
+
+
+def _test_my_voices_handlers_rename_play_and_delete():
+    win, restore = _voices_window(["Ada", "Brook", "Cleo"])
+    try:
+        from audio_utils import write_wav
+        for name in ("Ada", "Brook", "Cleo"):
+            write_wav(os.path.join(voice_library.VOICES_DIR, name, "reference.wav"), np.zeros(2400, dtype="float32"), 24000)
+        played = []
+        win.play = played.append
+        # playback: the action bar and Return/double-click on a row both play that voice's reference
+        win.lst_voices.item(0).setSelected(True)
+        win.btn_voice_play.click()
+        assert len(played) == 1 and played[-1].endswith(os.path.join("Ada", "reference.wav")), played
+        win.lst_voices.itemActivated.emit(win.lst_voices.item(1))
+        assert len(played) == 2 and "Brook" in played[-1], played
+        # rename: connected to real persistence, selection follows the renamed voice
+        original = QtWidgets.QInputDialog.getText
+        asked = []
+        QtWidgets.QInputDialog.getText = staticmethod(lambda *a, **k: (asked.append((a[1:3], k)) or ("Ada Prime", True)))
+        try:
+            win.btn_voice_rename.click()
+        finally:
+            QtWidgets.QInputDialog.getText = original
+        assert "'Ada'" in asked[0][0][1], asked
+        assert any(d["name"] == "Ada Prime" for d in voice_library.list_voice_details())
+        assert win.selected_voice_names() == ["Ada Prime"], win.selected_voice_names()
+        assert win.lbl_status.text() == "Renamed 'Ada' to 'Ada Prime'."
+        # delete: the confirmation names the voices (not folder slugs); No keeps them, Yes removes them all
+        win.lst_voices.selectAll()
+        question = QtWidgets.QMessageBox.question
+        prompts = []
+        QtWidgets.QMessageBox.question = staticmethod(lambda *a, **k: (prompts.append(a[2]) or QtWidgets.QMessageBox.No))
+        try:
+            win.btn_voice_delete.click()
+            assert win.lst_voices.count() == 3 and len(prompts) == 1
+            assert "3 voice(s)" in prompts[0] and "Ada Prime" in prompts[0] and "cannot be undone" in prompts[0], prompts
+            QtWidgets.QMessageBox.question = staticmethod(lambda *a, **k: QtWidgets.QMessageBox.Yes)
+            win.btn_voice_delete.click()
+        finally:
+            QtWidgets.QMessageBox.question = question
+        assert win.lst_voices.count() == 0 and voice_library.list_voices() == []
+        assert win.lbl_status.text() == "Deleted 3 voice(s)."
+        assert not win.frm_voices_empty.isHidden(), "deleting the last voice returns to the empty state"
+        win.close()
+    finally:
+        restore()
+    print("PASS: rename, playback and multi-delete handlers work from the new list, with contextual footer messages")
+
+
+def _test_my_voices_has_no_misleading_inline_editing():
+    win, restore = _voices_window(["Ada"])
+    try:
+        lst = win.lst_voices
+        assert lst.editTriggers() == QtWidgets.QAbstractItemView.NoEditTriggers
+        item = lst.item(0)
+        assert not item.flags() & QtCore.Qt.ItemIsEditable, "rows are not editable items"
+        lst.setCurrentRow(0)
+        lst.setFocus()
+        QTest.keyClick(lst, QtCore.Qt.Key_F2)
+        lst.edit(lst.model().index(0, 0))
+        _app.processEvents()
+        assert lst.findChildren(QtWidgets.QLineEdit) == [], "no editor may open for a name that cannot be saved"
+        assert lst.state() != QtWidgets.QAbstractItemView.EditingState
+        win.close()
+    finally:
+        restore()
+    print("PASS: rows are not editable in place; rename goes through the Rename action")
+
+
+def _test_my_voices_keyboard_selection_and_return():
+    win, restore = _voices_window(["Ada", "Brook", "Cleo"])
+    try:
+        from audio_utils import write_wav
+        for name in ("Ada", "Brook", "Cleo"):
+            write_wav(os.path.join(voice_library.VOICES_DIR, name, "reference.wav"), np.zeros(2400, dtype="float32"), 24000)
+        played = []
+        win.play = played.append
+        lst = win.lst_voices
+        lst.setFocus()
+        _app.processEvents()
+        QTest.keyClick(lst, QtCore.Qt.Key_Down)
+        lst.setCurrentRow(0)
+        QTest.keyClick(lst, QtCore.Qt.Key_Down)
+        assert win.selected_voice_names() == ["Brook"] and win.btn_voice_play.isEnabled()
+        QTest.keyClick(lst, QtCore.Qt.Key_Down, QtCore.Qt.ShiftModifier)
+        assert win.selected_voice_names() == ["Brook", "Cleo"] and not win.btn_voice_play.isEnabled() and win.btn_voice_delete.isEnabled()
+        QTest.keyClick(lst, QtCore.Qt.Key_Up)
+        QTest.keyClick(lst, QtCore.Qt.Key_Return)
+        assert len(played) == 1 and "Brook" in played[-1], played
+        QTest.keyClick(lst, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
+        assert len(win.selected_voice_slugs()) == 3, "select all works from the keyboard"
+        # type-ahead matches the voice name
+        lst.clearSelection()
+        lst.setCurrentRow(0)
+        QTest.keyClicks(lst, "c")
+        assert win.lst_voices.currentItem().text() == "Cleo"
+        win.close()
+    finally:
+        restore()
+    print("PASS: the list works from the keyboard: arrows, Shift-extend, select all, type-ahead and Return")
+
+
+def _test_my_voices_rows_paint_selection_and_focus_visibly():
+    win, restore = _voices_window(["Ada", "Brook", "Cleo"])
+    try:
+        lst = win.lst_voices
+        lst.item(1).setSelected(True)
+        lst.setCurrentRow(1, QtCore.QItemSelectionModel.NoUpdate)
+        _app.processEvents()
+
+        def pixel(row, dx, dy):
+            image = lst.viewport().grab().toImage()
+            rect = lst.visualItemRect(lst.item(row))
+            return image.pixelColor(rect.left() + dx, rect.top() + dy).name().upper()
+
+        accent, selection, surface = theme.COLORS["accent"], theme.COLORS["selection"], theme.COLORS["surface"]
+        assert pixel(1, 1, 30) == accent, "the selected row has an accent bar, not just a tint"
+        assert pixel(1, 200, 5) == selection and pixel(0, 200, 5) == surface
+        assert pixel(0, 1, 30) == surface, "unselected rows have no bar"
+        lst.setFocus()
+        _app.processEvents()
+        assert pixel(1, 1, 5) == accent and pixel(1, 200, 1) == accent, "keyboard focus draws a ring on the current row"
+        # contrast of the row text on the selected and resting backgrounds
+        c = theme.COLORS
+        for fg, bg in ((c["text"], c["selection"]), (c["text_secondary"], c["selection"]), (c["text_secondary"], c["surface"]),
+                       (c["text_muted"], c["surface"]), (c["accent"], c["surface"])):
+            assert theme.contrast_ratio(fg, bg) >= (3.0 if fg == c["accent"] else 4.5), (fg, bg)
+        win.close()
+    finally:
+        restore()
+    print("PASS: selection is an accent bar plus tint, keyboard focus draws a ring, row text keeps its contrast")
+
+
+def _test_my_voices_rows_are_exposed_to_accessibility():
+    """Rows are model items, so Qt's accessibility tree gives each one the full row text."""
+    win, restore = _voices_window(["Ada"])
+    try:
+        from PySide6 import QtGui as _gui
+        lst = win.lst_voices
+        assert lst.accessibleName() == "Saved voices"
+        iface = _gui.QAccessible.queryAccessibleInterface(lst)
+        assert iface is not None, "the list must be in the accessibility tree"
+        names = []
+        for i in range(iface.childCount()):
+            child = iface.child(i)
+            if child is not None:
+                names.append(child.text(_gui.QAccessible.Text.Name))
+        assert any("Ada" in n and "A warm narrator voice" in n for n in names), names
+        play = _gui.QAccessible.queryAccessibleInterface(win.btn_voice_play)
+        assert play.text(_gui.QAccessible.Text.Name).startswith("Play reference") or play.text(_gui.QAccessible.Text.Name) == "Play reference"
+        win.close()
+    finally:
+        restore()
+    print("PASS: the list and its rows expose names to the accessibility tree (VoiceOver itself not verified here)")
+
+
+def _test_my_voices_tab_stops_under_the_macos_default_tab_behavior():
+    macos_default = QtCore.Qt.TabFocusBehavior(3)
+    hints = _app.styleHints() if _app else _make_window()[0] and _app.styleHints()
+    original = hints.tabFocusBehavior()
+    restore = _with_voices(["Ada"])
+    try:
+        hints.setTabFocusBehavior(macos_default)
+        configure_keyboard_navigation(_app)      # what main() does at startup
+        win, _ = _make_window()
+        win.resize(1024, 640)
+        win.show_page(PAGE_VOICES)
+        _shown(win)
+        win.lst_voices.item(0).setSelected(True)
+        win.lst_voices.setCurrentRow(0, QtCore.QItemSelectionModel.NoUpdate)
+        win.btn_voice_refresh.setFocus()
+        _app.processEvents()
+        seen = []
+        for _ in range(5):
+            QTest.keyClick(win.windowHandle(), QtCore.Qt.Key_Tab)
+            _app.processEvents()
+            seen.append("list" if win.focusWidget() is win.lst_voices else getattr(win.focusWidget(), "text", lambda: "?")())
+        assert seen == ["list", "Play reference", "Rename", "Delete", "Engine references"], seen
+        win.close()
+    finally:
+        hints.setTabFocusBehavior(original)
+        restore()
+    print("PASS: every My Voices control, including the list, is a Tab stop under the macOS default tab behavior")
+
+
+class _RaisingModels:
+    """Raises a chosen exception from the model call, like a real load failure would."""
+
+    def __init__(self, make_exc):
+        self.make_exc, self.calls = make_exc, 0
+
+    def get(self, kind, notify=None):
+        self.calls += 1
+        raise self.make_exc()
+
+
+class _BlockedGenerateModels:
+    """Model loads at once; generation blocks until released, to observe the generating stage."""
+
+    def __init__(self):
+        self.release = threading.Event()
+
+    def get(self, kind, notify=None):
+        release = self.release
+
+        class Model(_FakeDesignModel):
+            def generate_voice_design(self, text, language, instruct):
+                release.wait(10)
+                return super().generate_voice_design(text, language, instruct)
+        return Model()
+
+
+def _test_failure_classification_names_only_reliable_causes():
+    import errno as _errno
+    import task_errors as te
+
+    def fail(exc):
+        try:
+            raise exc
+        except BaseException as caught:
+            return te.Failure.from_exception(caught)
+
+    flash = te.classify(fail(ImportError("FlashAttention2 has been toggled on, but it cannot be used due to the "
+                                         "following error: the package flash_attn seems to be not installed.")))
+    assert flash and flash.kind == "flash" and flash.settings and "FlashAttention" in flash.short
+    assert te.classify(fail(MemoryError())).kind == "memory"
+    assert te.classify(fail(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"))).kind == "memory"
+    assert te.classify(fail(OSError(_errno.ENOSPC, "No space left on device"))).kind == "disk"
+    assert te.classify(fail(ImportError("'qwen-tts' package is not installed. Install it with: pip install -U qwen-tts"))).kind == "package"
+    assert te.classify(te.Failure("requests.exceptions.ConnectionError", "boom", "")).kind == "network"
+    assert te.classify(te.Failure("huggingface_hub.errors.OfflineModeIsEnabled", "offline", "")).kind == "network"
+    # not reliably identifiable -> unknown, never guessed
+    for exc in (RuntimeError("something odd happened"), ValueError("bad input"), KeyError("x"),
+                RuntimeError("memory layout is not contiguous"), ImportError("No module named 'foo'"),
+                AssertionError("shape mismatch")):
+        assert te.classify(fail(exc)) is None, repr(exc)
+    assert te.Failure.from_exception(AssertionError()).message == "AssertionError", "a blank message must not hide the cause"
+    print("PASS: only reliably identifiable failures are named; everything else stays unknown")
+
+
+def _test_failure_details_are_sanitized_but_keep_the_cause():
+    import task_errors as te
+    home, app = "/Users/jane.doe", "/Users/jane.doe/Projects/qwen3-tts-gui"
+    raw = "\n".join([
+        "Traceback (most recent call last):",
+        '  File "%s/qt_app.py", line 1, in work' % app,
+        '  File "%s/anaconda3/envs/x/lib/python3.12/site-packages/transformers/a.py", line 9, in f' % home,
+        "ImportError: boom for jane.doe@example.com with token=abc123secret and hf_AbCdEfGhIjKlMnOpQr1234 "
+        "in %s/.cache and C:\\Users\\Jane\\file and /home/jane/x Bearer sk-live_abcdefghijklmnopqrstu" % home,
+    ])
+    failure = te.Failure("builtins.ImportError", "boom", raw, None)
+    text = te.details_text(failure, context={"Settings": "device=cpu, dtype=bfloat16, attention=sdpa"}, home=home, app_dir=app)
+    for private in ("jane.doe", "Jane", "jane", "abc123secret", "hf_AbCdEf", "sk-live", "example.com"):
+        assert private not in text, (private, text)
+    assert "<app>/qt_app.py" in text and "<site-packages>/transformers/a.py" in text
+    assert "builtins.ImportError" in text and "Settings: device=cpu" in text and "ImportError: boom" in text
+    assert failure.trace == raw, "the original failure context is preserved unsanitized in memory"
+    print("PASS: details drop private paths, tokens and emails but keep type, message, settings and trace")
+
+
+def _test_known_failure_explains_cause_action_and_details():
+    with _Patched():
+        def flash():
+            return ImportError("FlashAttention2 has been toggled on, but it cannot be used due to the following "
+                               "error: the package flash_attn seems to be not installed.")
+        models = _RaisingModels(flash)
+        win, _ = _make_window(models=models)
+        win.resize(1024, 640)
+        _shown(win)
+        win.txt_vd_instruct.setPlainText("A gravelly old sailor")
+        win.btn_vd_generate.setFocus()          # the person started it from the button
+        win.btn_vd_generate.click()
+        _wait_idle(win)
+        _app.processEvents()
+        assert win.vd_preview.currentIndex() == PV_ERROR
+        assert "FlashAttention" in win.lbl_vd_error.text() and "isn't installed" in win.lbl_vd_error.text()
+        assert "different Attention option" in win.lbl_vd_error_action.text()
+        assert not win.btn_vd_error_settings.isHidden(), "Settings is where this can be changed"
+        assert win.lbl_status.text() == "Couldn't generate the sample: FlashAttention isn't installed."
+        assert win.progress.maximum() == 1, "no animated footer progress after a failure"
+        details = win.txt_vd_details.toPlainText()
+        assert "builtins.ImportError" in details and "flash_attn" in details and "attention=" in details
+        assert os.path.expanduser("~") not in details and "Traceback" in details
+        assert win.txt_vd_details.isHidden() and win.btn_vd_details.text() == "Show details"
+        assert win.focusWidget() is win.btn_vd_retry, "focus lands on Retry so a keyboard user can act at once"
+        # Show details works from the keyboard and the text is focusable, scrollable and read-only
+        win.btn_vd_details.setFocus()
+        QTest.keyClick(win.btn_vd_details, QtCore.Qt.Key_Space)
+        _app.processEvents()
+        assert not win.txt_vd_details.isHidden() and win.btn_vd_details.text() == "Hide details" and win.btn_vd_details.isChecked()
+        QTest.keyClick(win.btn_vd_details, QtCore.Qt.Key_Tab)
+        _app.processEvents()
+        assert win.focusWidget() in (win.btn_vd_copy_details, win.txt_vd_details)
+        assert win.txt_vd_details.isReadOnly() and win.txt_vd_details.focusPolicy() != QtCore.Qt.NoFocus
+        assert win.txt_vd_details.height() <= 150
+        # Copy details puts the sanitized text on the clipboard and says so
+        win.btn_vd_copy_details.click()
+        assert QtWidgets.QApplication.clipboard().text() == details
+        assert win.lbl_status.text() == "Technical details copied."
+        # Retry reruns the same generation (and fails the same way, once more)
+        win.btn_vd_retry.click()
+        _wait_idle(win)
+        assert models.calls == 2 and win.vd_preview.currentIndex() == PV_ERROR
+        assert win.txt_vd_instruct.toPlainText() == "A gravelly old sailor"
+        for widget, name in ((win.lbl_vd_error, "Error"), (win.btn_vd_details, "Technical details"),
+                             (win.txt_vd_details, "Technical details text")):
+            assert widget.accessibleName() == name
+        win.close()
+    print("PASS: a known failure names its cause and next step, keeps details accessible, copyable and sanitized, and retries")
+
+
+def _test_unknown_failure_stays_generic_and_honest():
+    with _Patched():
+        models = _RaisingModels(lambda: RuntimeError("tensor shape mismatch in layer 7"))
+        win, _ = _make_window(models=models)
+        win.resize(1024, 640)
+        _shown(win)
+        win.txt_vd_instruct.setPlainText("A calm narrator")
+        win.txt_vd_instruct.setFocus()          # still editing the description when the failure arrives
+        win.btn_vd_generate.click()
+        _wait_idle(win)
+        assert win.focusWidget() is win.txt_vd_instruct, "an error must not take focus from someone who is typing"
+        assert win.lbl_vd_error.text() == "Something went wrong while creating the sample."
+        assert "unchanged" in win.lbl_vd_error_action.text() and "Show details" in win.lbl_vd_error_action.text()
+        assert win.btn_vd_error_settings.isHidden(), "no settings advice for a cause we cannot identify"
+        for claim in ("memory", "flash", "internet", "install", "Settings"):
+            assert claim.lower() not in win.lbl_vd_error.text().lower() + win.lbl_vd_error_action.text().lower()
+        assert win.lbl_status.text() == "Couldn't generate the sample. See the Preview for details."
+        win.btn_vd_details.click()
+        details = win.txt_vd_details.toPlainText()
+        assert "RuntimeError" in details and "tensor shape mismatch in layer 7" in details, "the real cause is in the details"
+        win.close()
+    print("PASS: an unknown failure stays generic, makes no claims, and the details carry the real exception")
+
+
+def _test_failed_regeneration_keeps_sample_and_offers_details():
+    with _Patched():
+        win, _ = _make_window(models=_FakeModels())
+        win.resize(1024, 640)
+        _shown(win)
+        win.btn_vd_generate.click()
+        _wait_idle(win)
+        win.models = _RaisingModels(lambda: MemoryError())
+        win.btn_vd_regenerate.click()
+        _wait_idle(win)
+        _app.processEvents()
+        assert win.vd_preview.currentIndex() == PV_READY and win.btn_vd_play.isEnabled()
+        assert "enough memory" in win.lbl_vd_notice.text() and "previous sample is still available" in win.lbl_vd_notice.text()
+        assert not win.btn_vd_notice_details.isHidden() and win.vd_regen_bar.isHidden()
+        assert "MemoryError" in win._failure_details
+        win.close()
+    print("PASS: a failed regeneration keeps the good sample, says why, and still offers the technical details")
+
+
+def _test_loading_shows_one_indicator_and_only_real_stages():
+    with _Patched():
+        slow = _SlowModels()
+        win, _ = _make_window(models=slow)
+        win.resize(1024, 640)
+        _shown(win)
+        assert win.vd_preview.currentIndex() == PV_EMPTY and win.progress.maximum() == 1 and win.btn_stop.isHidden()
+        win.txt_vd_instruct.setPlainText("A warm narrator")
+        win.btn_vd_generate.click()
+        for _ in range(20):
+            _app.processEvents()
+            time.sleep(0.02)
+        assert win.vd_preview.currentIndex() == PV_BUSY and win.busy
+        # stage 1: the backend reported it is loading the model
+        assert win.lbl_vd_busy.text() == qt_app.STAGE_LOADING and not win.lbl_vd_busy_hint.isHidden()
+        # exactly one animated indicator: the Preview's. The footer neither animates nor repeats the stage.
+        assert win.vd_busy_bar.indeterminate and win.vd_busy_bar.isVisible()
+        assert win.progress.maximum() == 1, "the footer bar must not animate while the Preview shows progress"
+        assert win.lbl_status.text() == qt_app.FOOTER_CREATING
+        assert "%" not in win.lbl_vd_busy.text() and "second" not in win.lbl_vd_busy.text().lower()
+        slow.release.set()
+        _wait_idle(win)
+        assert win.vd_preview.currentIndex() == PV_READY and win.lbl_status.text() == READY_STATUS
+        assert win.progress.maximum() == 1
+
+        blocked = _BlockedGenerateModels()
+        win2, _ = _make_window(models=blocked)
+        win2.resize(1024, 640)
+        _shown(win2)
+        win2.txt_vd_instruct.setPlainText("A warm narrator")
+        win2.btn_vd_generate.click()
+        for _ in range(20):
+            _app.processEvents()
+            time.sleep(0.02)
+        # stage 2: the model call has returned and generation is running
+        assert win2.lbl_vd_busy.text() == qt_app.STAGE_GENERATING and not win2.lbl_vd_busy_hint.isHidden()
+        assert win2.lbl_vd_busy_hint.text() == "This may take several minutes, depending on your device and sample length."
+        assert "elapsed" in win2.lbl_vd_elapsed.text()
+        assert win2.progress.maximum() == 1 and win2.vd_busy_bar.indeterminate
+        blocked.release.set()
+        _wait_idle(win2)
+        win.close()
+        win2.close()
+    print("PASS: one indicator in the Preview, no footer animation, and loading/generating shown only as reported")
+
+
+def _test_other_pages_keep_their_footer_progress():
+    with _Patched():
+        win, _ = _make_window()
+        win.run_task(lambda task: time.sleep(0.2) or "x", lambda r: None)
+        _app.processEvents()
+        assert win.busy and win.progress.maximum() == 0, "tasks without their own indicator still animate the footer"
+        _wait_idle(win)
+        assert win.progress.maximum() == 1
+        win.close()
+    print("PASS: Clone and Audiobook tasks keep the footer progress as their only indicator")
+
+
+def _test_import_voice_orange_outline_is_the_keyboard_focus_ring():
+    restore = _with_voices([])
+    try:
+        win, _ = _make_window()
+        win.resize(1024, 640)
+        win.show_page(PAGE_VOICES)
+        _shown(win)
+        button = win.btn_voice_import
+        assert button.property("role") in (None, ""), "Import voice is a neutral button, not primary"
+        accent = theme.COLORS["accent"]
+
+        def edge():
+            _app.processEvents()
+            return button.grab().toImage().pixelColor(0, button.height() // 2).name().upper()
+
+        win.nav_buttons[PAGE_VOICES].setFocus()
+        assert edge() != accent, "unfocused, the outline is the neutral control border"
+        button.setFocus()
+        assert edge() == accent, "focused, the accent outline is the focus indicator"
+        # arriving by clicking the sidebar does not park a focus ring on the first control of the page
+        win.show_page(0)
+        win.txt_vd_instruct.setFocus()
+        _app.processEvents()
+        QTest.mouseClick(win.nav_buttons[PAGE_VOICES], QtCore.Qt.LeftButton)
+        _app.processEvents()
+        assert win.stack.currentIndex() == PAGE_VOICES and win.focusWidget() is not button
+        assert edge() != accent
+        win.btn_voice_go_create.click() if not win.frm_voices_empty.isHidden() else None
+        assert win.stack.currentIndex() == 0 and win.focusWidget() is win.txt_vd_instruct
+        assert len(win.lbl_voices_empty.text()) < 90, win.lbl_voices_empty.text()
+        win.close()
+    finally:
+        restore()
+    print("PASS: Import voice's orange outline is the focus ring (neutral otherwise); the empty-state text is short")
 
 
 def _test_multiline_editors_never_trap_the_keyboard():
@@ -528,8 +1736,12 @@ def _test_tab_leaves_description_under_the_macos_default_tab_behavior():
         win.txt_vd_instruct.setFocus()
         _app.processEvents()
         key(win, QtCore.Qt.Key_Tab)
-        assert win.focusWidget() is win.txt_vd_instruct and "\t" in win.txt_vd_instruct.toPlainText(), \
-            "expected the macOS default to trap Tab; the emulation is not faithful"
+        # Stock macOS reaches only text controls: Tab skips the suggestions and the Generate button
+        # (the second text field, Sample text, is the next stop). The app's setting fixes that, below.
+        assert win.focusWidget() is win.txt_vd_sample, _focus_label(win.focusWidget())
+        assert "\t" not in win.txt_vd_instruct.toPlainText()
+        key(win, QtCore.Qt.Key_Tab)
+        assert win.focusWidget() is not win.btn_vd_generate, "stock macOS never lands on buttons"
         win.close()
 
         # With the app's startup configuration (what main() does) the full sequence works.
@@ -594,7 +1806,8 @@ def _test_stale_sample_callout_and_footer_status():
 
 _USED_ICONS = {"wand-sparkles", "copy", "mic-vocal", "book-open", "settings", "audio-lines", "play", "save",
                "download", "refresh-cw", "chevron-right", "chevron-down",
-               "square", "folder-open", "circle-check", "circle-exclamation-point"}
+               "square", "folder-open", "circle-check", "circle-exclamation-point",
+               "pause", "rotate-ccw", "rotate-cw", "pencil"}
 
 
 def _test_icon_assets_are_vendored_licensed_and_only_the_used_ones():
@@ -709,7 +1922,7 @@ def _test_primary_button_uses_the_specified_orange_and_white_content():
     image = button.icon().pixmap(button.iconSize(), 1.0, QtGui.QIcon.Normal).toImage()
     assert any(image.pixelColor(x, y).alpha() > 200 and image.pixelColor(x, y).name().upper() == "#FFFFFF"
                for x in range(image.width()) for y in range(image.height())), "the icon must be white"
-    win.vd_chips[-1][0].setFocus()
+    win.btn_vd_reset_text.setFocus()   # the control before Generate voice in Tab order
     _app.processEvents()
     QTest.keyClick(win.windowHandle(), QtCore.Qt.Key_Tab)
     _app.processEvents()
@@ -738,7 +1951,7 @@ def _test_footer_actions_have_labels_icons_and_preserved_handlers():
     audio_player.is_playing = lambda: True
     try:
         win._refresh_audio_state()
-        assert win.btn_stop_audio.isEnabled()
+        assert not win.btn_stop_audio.isHidden()
         win.btn_stop_audio.click()
         assert stopped == [1]
     finally:
@@ -767,13 +1980,13 @@ def _test_stop_audio_follows_the_players_real_state():
     audio_player.is_playing = lambda: state["playing"]
     try:
         win._refresh_audio_state()
-        assert not win.btn_stop_audio.isEnabled() and win.btn_stop_audio.toolTip() == qt_app.STOP_AUDIO_IDLE_TIP
+        assert win.btn_stop_audio.isHidden(), "no playback session: Stop audio is not shown"
         state["playing"] = True
         win._refresh_audio_state()
-        assert win.btn_stop_audio.isEnabled() and win.btn_stop_audio.toolTip() == qt_app.STOP_AUDIO_TIP
+        assert not win.btn_stop_audio.isHidden() and win.btn_stop_audio.toolTip() == qt_app.STOP_AUDIO_TIP
         state["playing"] = False                      # playback finished by itself
         win.audio_timer.timeout.emit()
-        assert not win.btn_stop_audio.isEnabled(), "back to idle once the player reports silence"
+        assert win.btn_stop_audio.isHidden(), "back to idle once the player reports silence"
         assert win.audio_timer.isActive() and win.audio_timer.interval() == 250
     finally:
         audio_player.is_playing = real_playing
@@ -791,8 +2004,10 @@ def _test_footer_status_is_contextual_and_never_duplicates_errors():
         win, _ = _make_window()
         assert win.lbl_status.text() == "Ready", "the Create Voice screen must not open on a library count"
         assert win.lbl_status_icon.isHidden()
-        win.refresh_voices_tab()                      # an explicit refresh may announce the count
-        assert win.lbl_status.text() == "0 voice(s) found."
+        win.refresh_voices_tab()                      # a silent re-read never announces a library count
+        assert win.lbl_status.text() == "Ready"
+        win.refresh_voices_clicked()                  # the Refresh button reports its own result, not a count
+        assert win.lbl_status.text() == "Voice list refreshed."
         win.status(READY_STATUS)
         assert not win.lbl_status_icon.isHidden() and win.lbl_status.text() == READY_STATUS
         win.status("Error: boom")
@@ -807,7 +2022,7 @@ def _test_footer_status_is_contextual_and_never_duplicates_errors():
         win.txt_vd_instruct.setPlainText("A gravelly old sailor")
         win.btn_vd_generate.click()
         _wait_idle(win)
-        assert win.lbl_vd_details.text() and win.lbl_vd_details.text() not in win.lbl_status.text()
+        assert win.txt_vd_details.toPlainText() and win.txt_vd_details.toPlainText() not in win.lbl_status.text()
         assert "Preview" in win.lbl_status.text()
         win.close()
     print("PASS: the footer says Ready at launch, uses a glyph for ready/error, and never repeats error details")
@@ -838,10 +2053,10 @@ def _test_footer_fits_and_is_keyboard_reachable_at_minimum_width():
         _app.processEvents()
         assert win.focusWidget() is win.btn_open_out
         assert not win.btn_stop_audio.focusPolicy() == QtCore.Qt.NoFocus
-        assert not win.btn_stop_audio.isEnabled(), "disabled controls must not take Tab"
+        assert win.btn_stop_audio.isHidden(), "a hidden control can never take Tab"
         audio_player.is_playing = lambda: True
         win._refresh_audio_state()
-        assert win.btn_stop_audio.isEnabled()
+        assert not win.btn_stop_audio.isHidden()
         win.btn_stop_audio.setFocus(QtCore.Qt.TabFocusReason)
         _app.processEvents()
         assert win.focusWidget() is win.btn_stop_audio
@@ -895,7 +2110,9 @@ def _tab(shift=False):
 def _focus_label(w):
     """Readable name for the focused widget; unknown kinds show up as '?Class' so tests can reject them."""
     if isinstance(w, QtWidgets.QPushButton):
-        return " ".join(w.text().split())
+        return " ".join(w.text().split()) or w.accessibleName()   # icon-only buttons are named, not blank
+    if isinstance(w, QtWidgets.QSlider):
+        return w.accessibleName()
     if isinstance(w, QtWidgets.QCheckBox):
         return w.text()
     if isinstance(w, QtWidgets.QComboBox):
@@ -934,9 +2151,10 @@ def _focus_cycle(win, backwards=False, limit=45):
 
 _CHIPS = ["Narration", "Relaxing", "Epic", "Professional"]
 _EMPTY_ORDER = (["Create Voice", "Voice description"] + _CHIPS
-                + ["Generate voice", "combo:english", "Advanced settings", "Open output folder"])
+                + ["Sample text", "Use standard text", "Generate voice", "combo:english", "Advanced settings", "Open output folder"])
 _READY_ORDER = (["Create Voice", "Voice description"] + _CHIPS
-                + ["Generate voice", "Play", "Voice name", "Save", "Download", "Regenerate",
+                + ["Sample text", "Use standard text", "Generate voice", "Sample text used for this sample", "Edit text", "Seek", "Back 5 seconds",
+                   "Play", "Forward 5 seconds", "Voice name", "Save", "Download", "Regenerate",
                    "combo:english", "Advanced settings", "Open output folder"])
 
 
@@ -1003,7 +2221,7 @@ def _test_keyboard_focus_order_is_logical():
         order = _focus_cycle(win)
         after = order[order.index("Advanced settings") + 1:]
         assert after == ["combo:Random", "Auto-save generated voices", "combo:Random", "Suggest name",
-                         "Audition text", "Open Settings", "Open output folder"], after
+                         "Open Settings", "Open output folder"], after
         assert not [l for l in order if l.startswith("?")]
         win.hide()
     print("PASS: Tab order = navigation, form, Generate, preview, settings, footer; no invisible stops")
@@ -1234,6 +2452,20 @@ def run_ui_tests():
     _test_generate_validates_without_starting_a_task()
     _test_generation_failure_shows_error_and_keeps_input()
     _test_generation_success_shows_real_preview()
+    _test_sample_text_provenance_and_editing()
+    _test_sample_text_is_a_first_class_field_in_the_main_form()
+    _test_create_voice_final_layout_flat_reader_scrollbars_and_contextual_origin()
+    _test_loading_ui_shows_real_elapsed_time_in_plain_wording()
+    _test_activity_bar_is_one_restrained_segment_that_only_runs_while_visible()
+    _test_footer_stop_audio_is_contextual_and_does_not_shift_the_footer()
+    _test_leaving_a_navigation_item_never_leaves_its_focus_ring_behind()
+    _test_navigation_ring_follows_keyboard_focus_only()
+    _test_saved_voice_and_download_use_the_spoken_text()
+    _test_preview_player_play_pause_resume_seek_stop_and_end()
+    _test_preview_player_stays_consistent_with_other_audio_and_pages()
+    _test_preview_player_without_pause_support_and_playback_errors()
+    _test_audio_player_position_pause_and_seek_over_pygame_clock()
+    _test_preview_player_keyboard_focus_and_minimum_size_layout()
     _test_tab_leaves_description_and_multiline_entry_still_works()
     _test_shift_tab_navigates_backwards()
     _test_keyboard_focus_order_is_logical()
@@ -1251,7 +2483,23 @@ def run_ui_tests():
     _test_my_voices_actions_fit_at_1024_px()
     _test_engine_references_require_exactly_one_voice()
     _test_engine_references_menu_works_from_the_keyboard()
+    _test_failure_classification_names_only_reliable_causes()
+    _test_failure_details_are_sanitized_but_keep_the_cause()
+    _test_known_failure_explains_cause_action_and_details()
+    _test_unknown_failure_stays_generic_and_honest()
+    _test_failed_regeneration_keeps_sample_and_offers_details()
+    _test_loading_shows_one_indicator_and_only_real_stages()
+    _test_other_pages_keep_their_footer_progress()
+    _test_import_voice_orange_outline_is_the_keyboard_focus_ring()
     _test_my_voices_tab_order()
+    _test_my_voices_rows_show_name_description_and_formatted_metadata()
+    _test_my_voices_selection_states_gate_the_actions()
+    _test_my_voices_handlers_rename_play_and_delete()
+    _test_my_voices_has_no_misleading_inline_editing()
+    _test_my_voices_keyboard_selection_and_return()
+    _test_my_voices_rows_paint_selection_and_focus_visibly()
+    _test_my_voices_rows_are_exposed_to_accessibility()
+    _test_my_voices_tab_stops_under_the_macos_default_tab_behavior()
     _test_multiline_editors_never_trap_the_keyboard()
     _test_tab_leaves_description_under_the_macos_default_tab_behavior()
     _test_stale_sample_callout_and_footer_status()

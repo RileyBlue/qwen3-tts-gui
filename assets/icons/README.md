@@ -1,6 +1,6 @@
 # Vendored icons
 
-Sixteen SVGs from [Lucide](https://lucide.dev) (`lucide-icons/lucide`, `icons/` folder, fetched
+Twenty SVGs from [Lucide](https://lucide.dev) (`lucide-icons/lucide`, `icons/` folder, fetched
 2026-11-13; latest release tag at that time: 1.72.0). They are copied unmodified; colour is applied
 at load time by `icons.py`, because Qt Style Sheets do not support `currentColor`.
 
