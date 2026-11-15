@@ -1168,6 +1168,91 @@ def _test_voice_replace_is_failure_safe():
     print("PASS: voice replacement is failure-safe")
 
 
+def _test_audio_loading_formats_and_capabilities():
+    """load_wav reads what the model's own decoder reads, supported_audio_extensions never advertises a format
+    that would fail, and unreadable files get a sentence the user can act on."""
+    import importlib.util
+    import soundfile as sf
+    import audio_utils
+
+    tmp = tempfile.mkdtemp()
+    t = np.arange(24000) / 24000
+    tone = (0.4 * np.sin(2 * np.pi * 220 * t)).astype("float32")
+
+    def check(name, **kw):
+        path = os.path.join(tmp, name)
+        sf.write(path, tone, 24000, **kw)
+        data, rate = audio_utils.load_wav(path)
+        assert rate == 24000 and data.ndim == 1 and data.dtype == np.float32, (name, rate, data.shape)
+        assert len(data) == 24000, (name, len(data))
+        assert np.abs(data - tone).max() < (0.02 if name.endswith(".mp3") else 1e-3), name
+        return path
+    # the standard-library path is unchanged for 16-bit PCM
+    pcm = os.path.join(tmp, "pcm16.wav")
+    write_wav(pcm, tone, 24000)
+    with wave.open(pcm, "rb") as w:
+        raw = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+    assert np.array_equal(audio_utils.load_wav(pcm)[0], raw), "16-bit PCM must read exactly as before"
+    # what the old reader rejected
+    check("float32.wav", subtype="FLOAT")
+    check("pcm24.wav", subtype="PCM_24")
+    check("flac24.flac", subtype="PCM_24")
+    if "MP3" in sf.available_formats():
+        check("tone.mp3")
+    # stereo keeps the first channel, like the old reader
+    stereo = os.path.join(tmp, "stereo_float.wav")
+    sf.write(stereo, np.stack([tone, -tone], axis=1), 24000, subtype="FLOAT")
+    left, _ = audio_utils.load_wav(stereo)
+    assert np.abs(left - tone).max() < 1e-3
+    # unreadable files: a usable sentence, never a raw decoder message
+    empty, junk, m4a = (os.path.join(tmp, n) for n in ("empty.wav", "junk.wav", "voice.m4a"))
+    open(empty, "wb").close()
+    open(junk, "wb").write(b"not audio" * 40)
+    open(m4a, "wb").write(b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64)
+    for bad in (empty, junk, m4a):
+        try:
+            audio_utils.load_wav(bad)
+        except audio_utils.AudioReadError as exc:
+            assert "Choose" in str(exc) and "Error" not in str(exc), str(exc)
+        else:
+            raise AssertionError(f"{bad} should not load")
+    # capability: what is offered is exactly what soundfile decodes; M4A is never advertised or accepted, even if a
+    # package named audioread happens to be installed (the model's loader would not use it)
+    real_find = importlib.util.find_spec
+    try:
+        importlib.util.find_spec = lambda name, *a, **k: object() if name == "audioread" else real_find(name, *a, **k)
+        exts = audio_utils.supported_audio_extensions()
+        assert ".m4a" not in exts and {".wav", ".flac"} <= set(exts), exts
+        assert "m4a" not in audio_utils.audio_file_filter()
+        for e in exts:   # offered and rejected must never both be true
+            probe = os.path.join(tmp, "probe" + e)
+            sf.write(probe, tone, 24000, format=e[1:].upper()) if e != ".mp3" or "MP3" in sf.available_formats() else None
+            if os.path.isfile(probe):
+                assert audio_utils.audio_problem(probe) is None, e
+        msg = audio_utils.audio_problem(m4a)
+        assert "M4A" in msg and "can't be read on this computer" in msg and "WAV" in msg, msg
+        assert "empty or damaged" in audio_utils.audio_problem(junk)
+        assert audio_utils.audio_problem(pcm) is None and audio_utils.audio_problem(os.path.join(tmp, "float32.wav")) is None
+    finally:
+        importlib.util.find_spec = real_find
+    # F5 reference: unreadable files keep failing as a ValueError naming the F5 reference; float WAV now works
+    import json
+    import voice_library
+    root = tempfile.mkdtemp()
+    os.makedirs(voice_library.voice_dir("F5 Check", root))
+    with open(os.path.join(voice_library.voice_dir("F5 Check", root), "voice.json"), "w") as f:
+        json.dump({"name": "F5 Check"}, f)
+    try:
+        voice_library.set_f5_reference("F5 Check", junk, "words", root)
+    except ValueError as exc:
+        assert str(exc).startswith("F5 reference: ") and "Choose" in str(exc), str(exc)
+    else:
+        raise AssertionError("a junk file must not become an F5 reference")
+    voice_library.set_f5_reference("F5 Check", os.path.join(tmp, "float32.wav"), "words", root)
+    assert os.path.isfile(os.path.join(voice_library.voice_dir("F5 Check", root), "f5_reference.wav"))
+    print("PASS: audio loading reads float, 24-bit, FLAC and MP3, never advertises undecodable formats, and explains unreadable files")
+
+
 def _test_clone_reports_how_many_chunks_it_planned():
     """The UI tells a real early stop from a Stop pressed after the last chunk by comparing with clone_chunks."""
     import numpy as np
@@ -1274,6 +1359,7 @@ def run_tests():
     _test_voice_library_roundtrip()
     _test_voice_replace_is_failure_safe()
     _test_clone_reports_how_many_chunks_it_planned()
+    _test_audio_loading_formats_and_capabilities()
     _test_emotion_tags_and_seed()
     _test_benchmark_helpers()
     print("All tests passed.")

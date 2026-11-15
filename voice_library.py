@@ -15,13 +15,12 @@ import secrets
 import shutil
 import threading
 import time
-import wave
 from datetime import datetime
 import random
 
 import numpy as np
 
-from audio_utils import load_voice_clone_prompt, save_voice_clone_prompt, write_wav, load_wav
+from audio_utils import load_voice_clone_prompt, save_voice_clone_prompt, write_wav, load_wav, AudioReadError
 
 VOICES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
 
@@ -372,8 +371,8 @@ def set_f5_reference(name, source_path, text, root=None):
         raise ValueError("Enter the transcript for the F5 reference recording.")
     try:
         wav, sample_rate = load_wav(source_path)
-    except (wave.Error, EOFError) as exc:
-        raise ValueError("F5 reference must be a valid PCM WAV file.") from exc
+    except AudioReadError as exc:   # load_wav converts every decoder failure into this
+        raise ValueError(f"F5 reference: {exc}") from exc
     if not len(wav) or len(wav) / sample_rate > 12:
         raise ValueError("F5 reference audio must be nonempty and no longer than 12 seconds.")
     path = voice_dir(name, root)

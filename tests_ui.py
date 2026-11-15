@@ -2447,6 +2447,12 @@ def _test_set_role_updates_property():
     print("PASS: set_role sets the dynamic property")
 
 
+def _tiny_wav(path, seconds=0.2, rate=24000):
+    """A real, decodable reference recording (validation now reads the header, so an empty file is rejected)."""
+    from audio_utils import write_wav
+    write_wav(path, np.zeros(int(seconds * rate), dtype=np.float32) + 0.05, rate)
+
+
 class _Library:
     """A throwaway voices folder so Clone Voice tests never touch the real library."""
 
@@ -2507,7 +2513,7 @@ def _test_clone_sources_are_exclusive_and_only_the_active_one_is_sent():
         lib.add("Ada")
         files = tempfile.mkdtemp()
         wav, npz = os.path.join(files, "ref.wav"), os.path.join(files, "p.npz")
-        open(wav, "wb").close()
+        _tiny_wav(wav)
         open(npz, "wb").close()
         win, _ = _clone_window(models=_FakeModels())
         win.refresh_voice_lists()
@@ -2560,8 +2566,8 @@ def _test_clone_validation_runs_before_any_model_loads():
         files = tempfile.mkdtemp()
         wav, npz = os.path.join(files, "ref.wav"), os.path.join(files, "p.npz")
         mp3 = os.path.join(files, "ref.mp3")
-        for p in (wav, mp3):
-            open(p, "wb").close()
+        _tiny_wav(wav)
+        open(mp3, "wb").close()   # never decoded: the WAV-only rule for Save answers first
         np.savez(npz, a=np.zeros(1))   # a dict-style prompt, not a list
         win, stub = _clone_window()
         win.refresh_voice_lists()
@@ -3037,6 +3043,137 @@ class _FakeSession:
     def __exit__(self, *exc):
         for n, fn in self.saved.items():
             setattr(audio_player, n, fn)
+
+
+def _test_saved_audio_without_a_preview_is_not_a_failed_generation():
+    with _Patched(), _Library() as lib, _FakeSession():
+        lib.add("Ada")
+        win, _ = _clone_window(models=_FakeModels())
+        win.refresh_voice_lists()
+        win.cmb_vc_voice.setCurrentIndex(0)
+        _shown(win)
+        win.txt_vc_text.setPlainText("Hello there")
+        mode = {"kind": "ok"}
+        original_clone, original_load = qt_app.TTSGenerator.clone, qt_app.load_wav
+        outputs = []
+
+        def clone(gen, **kwargs):
+            if mode["kind"] == "early":
+                gen.clone_chunks = 3
+                win.task.stop_event.set()
+                return [np.zeros(24000, dtype=np.float32) + 0.1] * 2, 24000
+            if mode["kind"] == "write_fails":
+                return [np.zeros(24000, dtype=np.float32) + 0.1], 24000
+            return [np.zeros(48000, dtype=np.float32) + 0.1], 24000
+
+        def load(path):
+            if mode["kind"] in ("unreadable", "early"):
+                raise OSError("cannot read back " + path)
+            return original_load(path)
+        qt_app.TTSGenerator.clone, qt_app.load_wav = clone, load
+
+        def generate(kind):
+            mode["kind"] = kind
+            win.btn_vc_generate.click()
+            _wait_idle(win)
+        try:
+            generate("ok")
+            first = win.vc_player.path()
+            assert win._vc_pv_state == qt_app.CV_READY and first
+            # the file is written, only reading it back fails
+            generate("unreadable")
+            path = win.last_output
+            assert path != first and os.path.isfile(path)
+            assert win._vc_pv_state == qt_app.CV_SAVED
+            title, detail = win.lbl_vc_pv_title.text(), win.lbl_vc_pv_detail.text()
+            assert title == "Audio saved. Preview unavailable" and "Couldn't generate" not in title + detail, (title, detail)
+            assert path in detail and "Play last output" in detail and "Open output folder" in detail
+            assert "cannot read back" not in detail, "the raw error stays behind Show details"
+            assert win.lbl_status.text().startswith("Done. Audio saved to: "), win.lbl_status.text()
+            assert not win.lbl_status.text().startswith(("Error", "Couldn't"))
+            assert win.btn_play_last.isEnabled() and win.btn_open_out.isEnabled()
+            assert not win.btn_vc_details.isHidden() and win.btn_vc_error_settings.isHidden()
+            assert "Clone Voice Preview" in win._clone_failure_details and "cannot read back" in win._clone_failure_details
+            # the earlier audio stays loaded and is labelled as the previous one
+            assert win.vc_player.path() == first and not win.lbl_vc_pv_prev.isHidden()
+            # a stopped-early run says which part was saved
+            generate("early")
+            assert win._vc_pv_state == qt_app.CV_SAVED and "only the part generated so far" in win.lbl_vc_pv_detail.text()
+            assert win.lbl_status.text().startswith("Stopped early; partial audio saved to: ")
+            # a failure to WRITE the file is still a failed generation
+            mode["kind"] = "write_fails"
+            original_save = qt_app.save_outputs
+            qt_app.save_outputs = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+            try:
+                win.btn_vc_generate.click()
+                _wait_idle(win)
+            finally:
+                qt_app.save_outputs = original_save
+            assert win._vc_pv_state == qt_app.CV_ERROR and "Couldn't generate" in win.lbl_vc_pv_title.text()
+            # the next good run recovers
+            generate("ok")
+            assert win._vc_pv_state == qt_app.CV_READY and win.btn_vc_details.isHidden()
+        finally:
+            qt_app.TTSGenerator.clone, qt_app.load_wav = original_clone, original_load
+    print("PASS: audio saved but not previewable is reported as saved, with the path, actions and details; real failures stay failures")
+
+
+def _test_reference_formats_are_validated_up_front_and_save_accepts_float_and_24bit_wav():
+    import importlib.util
+    import wave
+    import soundfile as sf
+    with _Patched(), _Library():
+        files = tempfile.mkdtemp()
+        tone = (0.3 * np.sin(np.arange(24000) / 20)).astype("float32")
+        paths = {}
+        for name, kw in (("float.wav", dict(subtype="FLOAT")), ("pcm24.wav", dict(subtype="PCM_24")),
+                         ("tone.flac", {}), ("plain.wav", dict(subtype="PCM_16"))):
+            paths[name] = os.path.join(files, name)
+            sf.write(paths[name], tone, 24000, **kw)
+        m4a = os.path.join(files, "note.m4a")
+        open(m4a, "wb").write(b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64)
+        empty = os.path.join(files, "empty.wav")
+        open(empty, "wb").close()
+        win, _ = _clone_window(models=_PromptModels())
+        win.btn_vc_src_ref.setChecked(True)
+        win.chk_vc_xvec.setChecked(True)
+        win.txt_vc_text.setPlainText("Hello")
+        real_find = importlib.util.find_spec
+        importlib.util.find_spec = lambda name, *a, **k: None if name == "audioread" else real_find(name, *a, **k)
+        try:
+            # the pickers never offer M4A while no decoder exists
+            assert "m4a" not in qt_app.audio_file_filter()
+            # Generate: an undecodable reference is explained before any model loads
+            win.edt_vc_ref.setText(m4a)
+            assert not win._validate_clone()
+            assert "M4A" in win.lbl_vc_error.text() and "WAV" in win.lbl_vc_error.text() and "Format not" not in win.lbl_vc_error.text()
+            win.edt_vc_ref.setText(empty)
+            assert not win._validate_clone() and "empty or damaged" in win.lbl_vc_error.text()
+            # supported formats pass, including FLAC and the WAV flavours the old reader rejected
+            for name, path in paths.items():
+                win.edt_vc_ref.setText(path)
+                assert win._validate_clone(), (name, win.lbl_vc_error.text())
+        finally:
+            importlib.util.find_spec = real_find
+        # Save as voice: float32 and 24-bit WAV now work and are stored as the usual 16-bit mono reference.wav
+        for i, name in enumerate(("float.wav", "pcm24.wav", "plain.wav")):
+            win.edt_vc_ref.setText(paths[name])
+            win.edt_vc_new_name.setText(f"Fmt {i}")
+            win.btn_vc_save_voice.click()
+            _wait_idle(win)
+            vdir = voice_library.voice_dir(f"Fmt {i}")
+            assert voice_library.voice_exists(f"Fmt {i}"), (name, win.lbl_status.text())
+            with wave.open(os.path.join(vdir, "reference.wav"), "rb") as w:
+                assert (w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()) == (1, 2, 24000, 24000), name
+            with open(os.path.join(vdir, "voice.json"), encoding="utf-8") as f:
+                cfg = json.load(f)
+            assert set(cfg) >= {"name", "description", "language", "seed", "created", "clone_prompt"} and cfg["sample_text"] == ""
+        # a FLAC is still refused for Save with the existing, actionable sentence
+        win.edt_vc_ref.setText(paths["tone.flac"])
+        win.edt_vc_new_name.setText("Fmt flac")
+        win.btn_vc_save_voice.click()
+        assert "needs a WAV" in win.lbl_vc_error.text() and not voice_library.voice_exists("Fmt flac")
+    print("PASS: reference formats are checked before any model loads; Save as voice accepts float32 and 24-bit WAV")
 
 
 def _test_clone_preview_states_transitions_and_player():
@@ -3613,6 +3750,8 @@ def run_ui_tests():
     _test_clone_save_records_the_real_seed_transcript_and_description()
     _test_import_voice_from_audio_stores_an_empty_transcript_and_no_invented_seed()
     _test_clone_preview_states_transitions_and_player()
+    _test_saved_audio_without_a_preview_is_not_a_failed_generation()
+    _test_reference_formats_are_validated_up_front_and_save_accepts_float_and_24bit_wav()
     _test_create_and_clone_players_share_the_audio_session_without_crosstalk()
     _test_transcript_editor_prefill_handles_missing_empty_and_real_ref_text()
     _test_clone_layout_keyboard_and_disclosure()

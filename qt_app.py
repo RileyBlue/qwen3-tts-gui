@@ -22,7 +22,8 @@ import icons
 import task_errors
 import voice_library
 import voice_list
-from audio_utils import save_outputs, write_wav, load_wav, load_voice_clone_prompt
+from audio_utils import (save_outputs, write_wav, load_wav, load_voice_clone_prompt, audio_problem,
+                         audio_file_filter)
 from config import (
     DEFAULT_ATTN, DEFAULT_DEVICE, DEFAULT_DTYPE, DEFAULT_LANGUAGE, DEFAULT_MAX_WORDS,
     DEFAULT_MIN_WORDS, ATTNS, DTYPES, LANGUAGES, MODELS, MODEL_MAP, OUTPUT_DIR,
@@ -93,7 +94,7 @@ def shortcut_text(sequence=GENERATE_SHORTCUT):
 
 # Preview panel pages (Create Voice).
 PV_EMPTY, PV_BUSY, PV_READY, PV_ERROR = range(4)
-CV_EMPTY, CV_BUSY, CV_READY, CV_ERROR, CV_PARTIAL, CV_STOPPED = range(6)   # Clone Voice result surface states
+CV_EMPTY, CV_BUSY, CV_READY, CV_ERROR, CV_PARTIAL, CV_STOPPED, CV_SAVED = range(7)   # Clone Voice result surface states
 
 
 def cuda_available():
@@ -2088,7 +2089,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edt_vc_ref.setAccessibleName("Reference audio file")
         self.btn_vc_ref_browse = QtWidgets.QPushButton("Browse…")
         self.btn_vc_ref_browse.clicked.connect(
-            lambda: self.browse(self.edt_vc_ref, "Audio (*.wav *.mp3 *.flac *.m4a *.ogg)"))
+            lambda: self.browse(self.edt_vc_ref, audio_file_filter()))
         self.lbl_vc_ref = self._clone_field("Reference audio", self.edt_vc_ref)
         rf.addWidget(self.lbl_vc_ref)
         rf.addWidget(self.row_with(self.edt_vc_ref, self.btn_vc_ref_browse))
@@ -2334,17 +2335,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_clone_preview(self, state, detail="", audio=None):
         """One state at a time: EMPTY, BUSY, READY, PARTIAL (stopped early, audio kept), STOPPED (stopped, no audio),
-        ERROR. `audio` = (path, samples, sample_rate) for READY and PARTIAL, which replace the player's audio.
-        BUSY, STOPPED and ERROR keep the previous audio on screen (as Create Voice keeps its last sample)."""
+        ERROR, SAVED (the audio was generated and saved, only the Preview couldn't load it). `audio` = (path,
+        samples, sample_rate) for READY and PARTIAL, which replace the player's audio. BUSY, STOPPED, ERROR and
+        SAVED keep the previous audio on screen (as Create Voice keeps its last sample)."""
         self._vc_pv_state = state
         replaces = state in (CV_READY, CV_PARTIAL) and audio is not None
-        keeps = state in (CV_BUSY, CV_STOPPED, CV_ERROR) and self.vc_player.has_audio()
+        keeps = state in (CV_BUSY, CV_STOPPED, CV_ERROR, CV_SAVED) and self.vc_player.has_audio()
         had_previous = self.vc_player.has_audio()
         title = {CV_EMPTY: "Your generated audio will appear here.",
                  CV_BUSY: "Generating audio…",
                  CV_READY: "Audio ready",
                  CV_PARTIAL: "Stopped early",
                  CV_STOPPED: "Stopped before any audio was produced",
+                 CV_SAVED: "Audio saved. Preview unavailable",
                  CV_ERROR: "Couldn't generate new audio" if had_previous else "Couldn't generate the audio"}[state]
         if state == CV_STOPPED:
             detail = detail or ("Nothing new was saved. Your previous audio is still available." if had_previous
@@ -2366,8 +2369,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_vc_pv_detail.setVisible(bool(detail))
         if focus is not None and self.clone_preview_panel.isAncestorOf(focus) and not focus.isVisibleTo(self.clone_preview_panel):
             self.txt_vc_text.setFocus()   # the control that had focus just disappeared; keep focus on something visible
-        if state in (CV_ERROR, CV_PARTIAL):
+        if state in (CV_ERROR, CV_PARTIAL, CV_SAVED):
             QtGui.QAccessible.updateAccessibility(QtGui.QAccessibleEvent(self.lbl_vc_pv_title, QtGui.QAccessible.Event.Alert))
+
+    def _store_clone_details(self, failure, task):
+        device, dtype, attn = self.model_settings()
+        self._clone_failure_details = task_errors.details_text(failure, task=task, context={
+            "Model": MODEL_MAP["voice-clone"],
+            "Settings": f"device={device}, dtype={dtype}, attention={attn}",
+            "Language": self.cmb_vc_lang.currentText(),
+            "Source": self.clone_source_kind()})
+
+    def _show_clone_saved_without_preview(self, path, early, exc):
+        """The audio was generated and written; only reading it back for the Preview failed. That is not a failed
+        generation: say it was saved, where, and that the footer's Play last output / Open output folder still work."""
+        self._store_clone_details(task_errors.Failure.from_exception(exc), "Clone Voice Preview")
+        lead = "Stopped early; only the part generated so far was saved. " if early else ""
+        self._set_clone_preview(CV_SAVED, f"{lead}Saved to {path}. The Preview couldn't load this file. "
+                                          "Use Play last output or Open output folder below to reach it.")
+        self.btn_vc_details.setVisible(True)
 
     def _show_clone_error(self, message, failure=None):
         """Explain a failed generation the way Create Voice does: a cause only when it is reliably identifiable, an
@@ -2377,12 +2397,7 @@ class MainWindow(QtWidgets.QMainWindow):
         explanation = task_errors.classify(failure, noun="audio")
         summary = explanation.summary if explanation else task_errors.UNKNOWN_SUMMARY_AUDIO
         action = explanation.action if explanation else task_errors.UNKNOWN_ACTION_AUDIO
-        device, dtype, attn = self.model_settings()
-        self._clone_failure_details = task_errors.details_text(failure, task="Clone Voice audio", context={
-            "Model": MODEL_MAP["voice-clone"],
-            "Settings": f"device={device}, dtype={dtype}, attention={attn}",
-            "Language": self.cmb_vc_lang.currentText(),
-            "Source": self.clone_source_kind()})
+        self._store_clone_details(failure, "Clone Voice audio")
         had_previous = self.vc_player.has_audio()
         self._set_clone_preview(CV_ERROR, f"{summary} {action}" + (" Your previous audio is still available." if had_previous else ""))
         self.btn_vc_details.setVisible(True)
@@ -2514,6 +2529,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 return self._clone_error("The reference recording was not found.", self.edt_vc_ref)
             if for_save and os.path.splitext(path)[1].lower() != ".wav":
                 return self._clone_error("Saving a voice needs a WAV recording.", self.edt_vc_ref)
+            problem = audio_problem(path)   # header only: an unsupported or damaged file is explained before any model loads
+            if problem:
+                return self._clone_error(problem, self.edt_vc_ref)
             if not self.chk_vc_xvec.isChecked() and not self.txt_vc_ref_text.toPlainText().strip():
                 return self._clone_error(
                     "Enter the transcript of the recording, or choose X-vector only.", self.txt_vc_ref_text)
@@ -2587,13 +2605,17 @@ class MainWindow(QtWidgets.QMainWindow):
             early = stop_pressed and (len(wavs) < expected if expected is not None else True)
             try:
                 path = on_done(result, early=early)   # writes the file, sets last_output and the footer status
-                audio = None
-                if path:
-                    samples, rate = load_wav(path)
-                    audio = (path, samples, rate)
-            except Exception as exc:
+            except Exception as exc:                  # nothing usable was written: a real failure
                 self._show_clone_error(str(exc), task_errors.Failure.from_exception(exc))
                 return
+            audio = None
+            if path:
+                try:
+                    samples, rate = load_wav(path)
+                    audio = (path, samples, rate)
+                except Exception as exc:              # the file exists; only the Preview can't show it
+                    self._show_clone_saved_without_preview(path, early, exc)
+                    return
             if audio is None:
                 self._set_clone_preview(CV_STOPPED)
             elif early:
@@ -3037,7 +3059,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def create_voice_from_audio(self):
         """Build a new voice from a WAV file + transcript (no model generation needed for the prompt)."""
         wav_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select reference audio", "", "Audio (*.wav *.mp3 *.flac *.m4a *.ogg)")
+            self, "Select reference audio", "", audio_file_filter())
         if not wav_path:
             return
         name, ok = QtWidgets.QInputDialog.getText(
