@@ -7,10 +7,14 @@ Each voice lives in voices/<slug>/ :
     emotions/         cached per-emotion clone prompts (created on demand)
 """
 
+import contextlib
 import json
 import os
 import re
+import secrets
 import shutil
+import threading
+import time
 import wave
 from datetime import datetime
 import random
@@ -69,41 +73,279 @@ def voice_exists(name, root=None):
     return os.path.isfile(os.path.join(voice_dir(name, root), "voice.json"))
 
 
+class VoiceSaveError(RuntimeError):
+    """A save or replace failed. The message says what state the existing voice is in."""
+
+
+_PENDING_DIR = ".pending"        # slugify() strips dots, so no voice can ever be named like this
+_save_lock = threading.RLock()
+
+
+LOCK_TIMEOUT = 10.0   # seconds a save waits for another Qwen3-TTS window that is saving or recovering
+
+
+def _try_lock(handle):
+    """Take an exclusive, non-blocking lock on an open file. True when held. Unsupported platforms: True (no protection)."""
+    try:
+        import fcntl
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+    except ImportError:
+        pass
+    try:
+        import msvcrt
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    except ImportError:
+        return True
+
+
+def _unlock(handle):
+    try:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    except ImportError:
+        pass
+    except OSError:
+        return
+    try:
+        import msvcrt
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except (ImportError, OSError):
+        pass
+
+
+@contextlib.contextmanager
+def _root_lock(root, timeout):
+    """Cross-process lock on the voices folder, held while a save or a recovery rewrites it. Yields False when it
+    could not be taken within `timeout` seconds. The OS drops it if the process dies, so it can never go stale."""
+    try:
+        os.makedirs(root, exist_ok=True)
+        handle = open(os.path.join(root, ".voices.lock"), "a+")
+    except OSError as exc:
+        raise VoiceSaveError(f"Couldn't save the voice ({exc}). Nothing was changed.") from exc
+    held = False
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            held = _try_lock(handle)
+            if held or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        yield held
+    finally:
+        if held:
+            _unlock(handle)
+        handle.close()
+
+
+def _pending_root(root=None):
+    return os.path.join(root or VOICES_DIR, _PENDING_DIR)
+
+
+def _write_text_durably(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+
+
+def _fsync_path(path):
+    """Best-effort flush of a file or folder to disk (some platforms cannot open folders)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def recover_interrupted_saves(root=None):
+    """Public entry point (app start): skipped, returning [], while another window is saving."""
+    root = root or VOICES_DIR
+    if not os.path.isdir(_pending_root(root)):
+        return []
+    try:
+        with _save_lock, _root_lock(root, 0) as held:
+            return _recover_locked(root) if held else []
+    except VoiceSaveError:
+        return []   # a read-only folder has nothing to recover, and start-up must not fail on it
+
+
+def _recover_locked(root=None):
+    """Finish or undo a replace that was interrupted (crash) between its two renames.
+
+    A previous version parked in .pending/<slug>.old-* is put back when the voice folder is missing,
+    and discarded when the new version is already in place. Half-written .new-* folders and finished
+    .done-* leftovers (the replace succeeded but deleting the old copy failed) are removed; a .done-*
+    folder is never restored, so a voice the user deleted afterwards stays deleted.
+    Returns the slugs that were restored."""
+    root = root or VOICES_DIR
+    pending = _pending_root(root)
+    restored = []
+    if not os.path.isdir(pending):
+        return restored
+    with _save_lock:
+        for entry in sorted(os.listdir(pending)):
+            full = os.path.join(pending, entry)
+            if ".done-" in entry or ".new-" in entry:
+                shutil.rmtree(full, ignore_errors=True)
+            elif ".old-" in entry:
+                slug = entry.rsplit(".old-", 1)[0]
+                final = os.path.join(root, slug)
+                if os.path.lexists(final):
+                    shutil.rmtree(full, ignore_errors=True)
+                else:
+                    try:
+                        os.rename(full, final)
+                        restored.append(slug)
+                    except OSError:
+                        pass   # left in place; nothing is deleted when it cannot be restored
+        try:
+            os.rmdir(pending)
+        except OSError:
+            pass
+    return restored
+
+
+def describe_voice_assets(name, root=None):
+    """Plain-language list of what replacing this voice discards, for the confirmation dialog."""
+    path = voice_dir(name, root)
+    items = []
+    if os.path.isfile(os.path.join(path, "reference.wav")):
+        items.append("its recording and clone prompt")
+    emotions = os.path.join(path, "emotions")
+    if os.path.isdir(emotions):
+        count = len([e for e in os.listdir(emotions) if e.endswith(".npz")])
+        if count:
+            items.append(f"{count} cached emotion sample{'s' if count != 1 else ''}")
+    try:
+        with open(os.path.join(path, "voice.json"), encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        config = {}
+    if config.get("f5_ref_audio") or config.get("f5_ref_text"):
+        items.append("its F5 reference recording and transcript")
+    if config.get("csm_ref_text"):
+        items.append("its CSM/Dia transcript")
+    return items
+
+
 def save_voice(name, wav, sr, prompt, description, language, seed,
                model_ids=None, root=None, overwrite=False, sample_text=None):
     """Write a voice folder and return its config dict. `sample_text` is the text spoken in `wav`
-    (default: the standard audition passage); it is stored as sample_text and ref_text."""
-    sample_text = sample_text or SAMPLE_TEXT
-    if not slugify(name):
+    (None: the standard audition passage; "": the recording has no known transcript, stored as empty).
+    It is stored as sample_text and ref_text.
+
+    The new voice is built in a staging folder first and only then moved into place, so a failed write
+    never touches an existing voice (files are flushed before the swap; durability across power loss is
+    best effort and platform dependent). Replacing renames the old folder aside, moves the new one in and
+    deletes the old one last; if the move fails the old folder is put back. Assets bound to the old
+    recording (emotion cache, F5 reference, CSM transcript) are not carried over: they would describe
+    a different speaker."""
+    sample_text = SAMPLE_TEXT if sample_text is None else sample_text   # "" is a real value: no transcript
+    slug = slugify(name)
+    if not slug:
         raise ValueError("Voice name must contain letters or digits.")
     path = voice_dir(name, root)
-    if os.path.exists(path):
-        if not overwrite:
+    with _save_lock, _root_lock(root or VOICES_DIR, LOCK_TIMEOUT) as held:
+        if not held:
+            raise VoiceSaveError("Another Qwen3-TTS window is saving a voice right now. "
+                                 "Try again in a moment. Nothing was changed.")
+        _recover_locked(root)
+        exists = os.path.lexists(path)
+        if exists and not overwrite:
             raise FileExistsError(f"A voice named '{name}' already exists.")
-        shutil.rmtree(path)
-    os.makedirs(path)
+        if exists and (os.path.islink(path) or not os.path.isfile(os.path.join(path, "voice.json"))):
+            raise FileExistsError(f"'{os.path.basename(path)}' exists in the voices folder but is not a saved voice.")
+        pending = _pending_root(root)
+        token = secrets.token_hex(6)
+        stage = os.path.join(pending, f"{slug}.new-{token}")
+        backup = os.path.join(pending, f"{slug}.old-{token}")
+        kept = "The existing voice is unchanged." if exists else "Nothing was saved."
+        try:
+            os.makedirs(pending, exist_ok=True)
+            os.mkdir(stage)
+            write_wav(os.path.join(stage, "reference.wav"), np.asarray(wav), sr)
+            save_voice_clone_prompt(os.path.join(stage, "clone_prompt.npz"), prompt)
+            config = {
+                "schema": 1,
+                "name": name.strip(),
+                "created": datetime.now().isoformat(timespec="seconds"),
+                "language": language,
+                "description": description,
+                "seed": int(seed),
+                "sample_text": sample_text,
+                "ref_text": sample_text,
+                "ref_audio": "reference.wav",
+                "clone_prompt": "clone_prompt.npz",
+                "sample_rate": int(sr),
+                "models": model_ids or {},
+                "usage": USAGE_NOTES,
+            }
+            _write_text_durably(os.path.join(stage, "voice.json"), json.dumps(config, indent=2, ensure_ascii=False))
+            for member in ("reference.wav", "clone_prompt.npz"):
+                _fsync_path(os.path.join(stage, member))
+            _fsync_path(stage)
+        except BaseException as exc:
+            shutil.rmtree(stage, ignore_errors=True)
+            if isinstance(exc, OSError):
+                raise VoiceSaveError(f"Couldn't save the voice ({exc}). {kept}") from exc
+            raise
 
-    write_wav(os.path.join(path, "reference.wav"), np.asarray(wav), sr)
-    save_voice_clone_prompt(os.path.join(path, "clone_prompt.npz"), prompt)
-
-    config = {
-        "schema": 1,
-        "name": name.strip(),
-        "created": datetime.now().isoformat(timespec="seconds"),
-        "language": language,
-        "description": description,
-        "seed": int(seed),
-        "sample_text": sample_text,
-        "ref_text": sample_text,
-        "ref_audio": "reference.wav",
-        "clone_prompt": "clone_prompt.npz",
-        "sample_rate": int(sr),
-        "models": model_ids or {},
-        "usage": USAGE_NOTES,
-    }
-    with open(os.path.join(path, "voice.json"), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-    return config
+        moved_old = False
+        try:
+            if os.path.lexists(path):
+                if not overwrite:   # appeared while the files were being written
+                    raise FileExistsError(f"A voice named '{name}' already exists.")
+                os.rename(path, backup)
+                moved_old = True
+            os.rename(stage, path)
+        except BaseException as exc:
+            shutil.rmtree(stage, ignore_errors=True)
+            if not moved_old:
+                if isinstance(exc, FileExistsError) or not isinstance(exc, Exception):
+                    raise
+                raise VoiceSaveError(f"Couldn't save the voice ({exc}). Nothing was changed.") from exc
+            try:
+                os.rename(backup, path)
+            except OSError:
+                raise VoiceSaveError(
+                    f"Couldn't save the voice ({exc}), and the previous version could not be put back. "
+                    f"It is kept at {backup}.") from exc
+            if not isinstance(exc, Exception):
+                raise
+            raise VoiceSaveError(f"Couldn't save the voice ({exc}). The previous version is unchanged.") from exc
+        if moved_old:
+            # The save has succeeded. Rename the old copy so that, if deleting it fails, recovery can tell it
+            # is finished business and never restores it over a voice the user later deletes or renames.
+            leftover = backup.replace(".old-", ".done-")
+            try:
+                os.rename(backup, leftover)
+            except OSError:
+                leftover = backup
+            shutil.rmtree(leftover, ignore_errors=True)
+        try:
+            os.rmdir(pending)
+        except OSError:
+            pass
+        return config
 
 
 def load_voice(name, root=None):

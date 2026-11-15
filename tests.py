@@ -899,10 +899,302 @@ def _test_voice_library_roundtrip():
             pass
         voice_library.delete_voice("My Voice!", root)
         assert voice_library.list_voices(root) == []
+        # transcript semantics: None = standard passage, "" = explicitly no transcript, text = stored exactly
+        for given, stored in ((None, voice_library.SAMPLE_TEXT), ("", ""), ("Real words.", "Real words.")):
+            cfg = voice_library.save_voice("T", wav, 24000, prompt, "", "english", 3, root=root,
+                                           overwrite=True, sample_text=given)
+            assert cfg["ref_text"] == cfg["sample_text"] == stored and cfg["seed"] == 3
     finally:
         import shutil
         shutil.rmtree(root, ignore_errors=True)
     print("PASS: voice library round trip")
+
+
+def _snapshot_tree(path):
+    """{relative path: bytes} for every file under path, plus directories, to prove nothing changed."""
+    out = {}
+    for base, dirs, files in os.walk(path):
+        for d in dirs:
+            out[os.path.relpath(os.path.join(base, d), path) + "/"] = b""
+        for f in files:
+            full = os.path.join(base, f)
+            with open(full, "rb") as fh:
+                out[os.path.relpath(full, path)] = fh.read()
+    return out
+
+
+def _test_voice_replace_is_failure_safe():
+    import json
+    import shutil
+    import tempfile
+    import numpy as np
+    import torch
+    from unittest.mock import patch
+    import voice_library as vl
+
+    wav = np.zeros(2400, dtype=np.float32)
+    prompt = [_FakePrompt(torch.zeros(3))]
+    root = tempfile.mkdtemp(dir=os.path.dirname(os.path.abspath(__file__)))
+
+    def listing():
+        return sorted(os.listdir(root)), vl.list_voices(root), [d["name"] for d in vl.list_voice_details(root)]
+
+    def make_old():
+        shutil.rmtree(root, ignore_errors=True)
+        os.makedirs(root)
+        vl.save_voice("Ana", wav, 24000, prompt, "old description", "english", 11, root=root)
+        folder = vl.voice_dir("Ana", root)
+        os.makedirs(os.path.join(folder, "emotions"))
+        with open(os.path.join(folder, "emotions", "abc.npz"), "wb") as f:
+            f.write(b"emotion-cache")
+        with open(os.path.join(folder, "f5_reference.wav"), "wb") as f:
+            f.write(b"old-f5")
+        cfg_path = os.path.join(folder, "voice.json")
+        cfg = json.load(open(cfg_path, encoding="utf-8"))
+        cfg.update(csm_ref_text="old transcript", f5_ref_audio="f5_reference.wav", f5_ref_text="old f5")
+        json.dump(cfg, open(cfg_path, "w", encoding="utf-8"))
+        return folder, _snapshot_tree(folder)
+
+    def replace(**kw):
+        return vl.save_voice("Ana", wav, 22050, prompt, "new description", "english", 5,
+                             root=root, overwrite=True, **kw)
+
+    try:
+        # --- success: the new version replaces everything bound to the old recording
+        folder, before = make_old()
+        assert vl.describe_voice_assets("Ana", root) == [
+            "its recording and clone prompt", "1 cached emotion sample",
+            "its F5 reference recording and transcript", "its CSM/Dia transcript"]
+        cfg = replace()
+        after = _snapshot_tree(folder)
+        assert cfg["description"] == "new description" and cfg["sample_rate"] == 22050
+        assert not os.path.exists(os.path.join(folder, "emotions")) and "f5_reference.wav" not in after
+        assert "csm_ref_text" not in json.load(open(os.path.join(folder, "voice.json"), encoding="utf-8"))
+        assert sorted(set(os.listdir(root)) - {".voices.lock"}) == ["Ana"], os.listdir(root)   # no staging or backup left behind
+
+        # --- failure injection: every step leaves the old voice byte-identical and listed exactly once
+        real_rename, real_rmtree = os.rename, shutil.rmtree
+        stage_failures = {
+            "write_wav": patch("voice_library.write_wav", side_effect=OSError("disk full")),
+            "write_prompt": patch("voice_library.save_voice_clone_prompt", side_effect=PermissionError("denied")),
+            "write_json": patch("voice_library._write_text_durably", side_effect=OSError("io error")),
+        }
+        for label, patcher in stage_failures.items():
+            folder, before = make_old()
+            with patcher:
+                try:
+                    replace()
+                    raise AssertionError(f"{label}: expected a failure")
+                except vl.VoiceSaveError as exc:
+                    assert "existing voice is unchanged" in str(exc), (label, exc)
+            assert _snapshot_tree(folder) == before, label
+            assert listing()[1:] == (["Ana"], ["Ana"]), label
+            pending_dir = os.path.join(root, ".pending")
+            assert not os.path.isdir(pending_dir) or os.listdir(pending_dir) == [], label   # no staging left behind
+
+        # second rename (staging -> final) fails: the backup is put back
+        folder, before = make_old()
+        calls = []
+
+        def fail_second(src, dst):
+            calls.append((src, dst))
+            if len(calls) == 2:
+                raise PermissionError("denied")
+            return real_rename(src, dst)
+
+        with patch("voice_library.os.rename", side_effect=fail_second):
+            try:
+                replace()
+                raise AssertionError("expected VoiceSaveError")
+            except vl.VoiceSaveError as exc:
+                assert "previous version is unchanged" in str(exc), exc
+        assert _snapshot_tree(folder) == before and vl.list_voices(root) == ["Ana"]
+
+        # first rename (old -> backup) fails: nothing was touched
+        folder, before = make_old()
+        with patch("voice_library.os.rename", side_effect=PermissionError("denied")):
+            try:
+                replace()
+                raise AssertionError("expected VoiceSaveError")
+            except vl.VoiceSaveError as exc:
+                assert "Nothing was changed" in str(exc), exc
+        assert _snapshot_tree(folder) == before
+
+        # second rename AND the rollback fail: the error names where the old voice is kept, and recovery restores it
+        folder, before = make_old()
+        calls = []
+
+        def fail_after_first(src, dst):
+            calls.append((src, dst))
+            if len(calls) >= 2:
+                raise PermissionError("denied")
+            return real_rename(src, dst)
+
+        with patch("voice_library.os.rename", side_effect=fail_after_first):
+            try:
+                replace()
+                raise AssertionError("expected VoiceSaveError")
+            except vl.VoiceSaveError as exc:
+                assert "kept at" in str(exc) and ".pending" in str(exc), exc
+        assert not os.path.exists(folder)
+        assert vl.recover_interrupted_saves(root) == ["Ana"]
+        assert _snapshot_tree(folder) == before and vl.list_voices(root) == ["Ana"]
+
+        # an interrupt between the two renames still rolls back
+        folder, before = make_old()
+        calls = []
+
+        def crash_after_first(src, dst):
+            calls.append((src, dst))
+            if len(calls) == 2:
+                raise KeyboardInterrupt()
+            return real_rename(src, dst)
+
+        with patch("voice_library.os.rename", side_effect=crash_after_first):
+            try:
+                replace()
+                raise AssertionError("expected KeyboardInterrupt")
+            except KeyboardInterrupt:
+                pass
+        assert _snapshot_tree(folder) == before   # even an interrupt rolls back
+
+        # deleting the backup fails: the save still succeeded
+        folder, before = make_old()
+        def rmtree_fails_on_backup(path, *a, **k):
+            if ".old-" in os.path.basename(path):
+                if k.get("ignore_errors"):
+                    return None   # what ignore_errors=True does with a "busy" folder
+                raise OSError("busy")
+            return real_rmtree(path, *a, **k)
+        with patch("voice_library.shutil.rmtree", side_effect=rmtree_fails_on_backup):
+            replace()
+        assert json.load(open(os.path.join(folder, "voice.json"), encoding="utf-8"))["description"] == "new description"
+        assert vl.list_voices(root) == ["Ana"]
+        # that leftover is marked finished: deleting the voice afterwards must never bring the old copy back
+        vl.delete_voice("Ana", root)
+        assert vl.recover_interrupted_saves(root) == [] and vl.list_voices(root) == [] and not os.path.exists(folder)
+
+        # a stale backup left next to a finished replace is discarded, a stale .new is removed
+        folder, before = make_old()
+        pending = os.path.join(root, ".pending")
+        os.makedirs(os.path.join(pending, "Ana.old-zzz"))
+        os.makedirs(os.path.join(pending, "Ana.new-zzz"))
+        os.makedirs(os.path.join(pending, "Ana.done-zzz"))
+        assert vl.recover_interrupted_saves(root) == [] and not os.path.exists(pending)
+
+        # --- collisions and refusals
+        folder, before = make_old()
+        for other in ("Ana", "ana", " Ana "):          # same slug (and, on a case-insensitive disk, same folder)
+            if other.strip().lower() == "ana" and os.path.exists(vl.voice_dir(other, root)):
+                try:
+                    vl.save_voice(other, wav, 24000, prompt, "x", "english", 1, root=root)
+                    raise AssertionError("expected FileExistsError")
+                except FileExistsError:
+                    pass
+        assert vl.voice_dir("Ana B", root) == vl.voice_dir("Ana_B", root)
+        vl.save_voice("Ana B", wav, 24000, prompt, "x", "english", 1, root=root)
+        try:
+            vl.save_voice("Ana_B", wav, 24000, prompt, "y", "english", 1, root=root)
+            raise AssertionError("expected FileExistsError")
+        except FileExistsError:
+            pass
+        long_a, long_b = "v" * 70 + "A", "v" * 70 + "B"   # both truncate to the same 60-character folder
+        assert vl.voice_dir(long_a, root) == vl.voice_dir(long_b, root)
+        vl.save_voice(long_a, wav, 24000, prompt, "x", "english", 1, root=root)
+        try:
+            vl.save_voice(long_b, wav, 24000, prompt, "y", "english", 1, root=root)
+            raise AssertionError("expected FileExistsError")
+        except FileExistsError:
+            pass
+        assert _snapshot_tree(folder) == before
+        # overwrite=True never replaces a folder that is not a voice
+        os.makedirs(os.path.join(root, "Notes"))
+        with open(os.path.join(root, "Notes", "keep.txt"), "w") as f:
+            f.write("mine")
+        try:
+            vl.save_voice("Notes", wav, 24000, prompt, "x", "english", 1, root=root, overwrite=True)
+            raise AssertionError("expected FileExistsError")
+        except FileExistsError:
+            pass
+        assert open(os.path.join(root, "Notes", "keep.txt")).read() == "mine"
+
+        # --- two app instances: a save waits for, and never overlaps, another process holding the folder lock
+        if os.name == "posix":
+            import subprocess
+            import time
+            folder, before = make_old()
+            holder = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl,sys,time\n"
+                 "f=open(sys.argv[1]+'/.voices.lock','a+'); fcntl.flock(f, fcntl.LOCK_EX)\n"
+                 "print('held', flush=True); time.sleep(30)", root],
+                stdout=subprocess.PIPE, text=True)
+            try:
+                assert holder.stdout.readline().strip() == "held"
+                os.makedirs(os.path.join(root, ".pending", "Ana.old-qq"))   # recovery must not touch it while locked
+                assert vl.recover_interrupted_saves(root) == [] and os.path.isdir(os.path.join(root, ".pending", "Ana.old-qq"))
+                real_timeout, vl.LOCK_TIMEOUT = vl.LOCK_TIMEOUT, 0.3
+                try:
+                    replace()
+                    raise AssertionError("expected VoiceSaveError while another process holds the lock")
+                except vl.VoiceSaveError as exc:
+                    assert "Another Qwen3-TTS window" in str(exc) and "Nothing was changed" in str(exc), exc
+                finally:
+                    vl.LOCK_TIMEOUT = real_timeout
+                assert _snapshot_tree(folder) == before
+            finally:
+                holder.kill()
+                holder.wait()
+            replace()   # the lock dies with its process, so the next save goes through
+            assert vl.list_voices(root) == ["Ana"]
+
+        # --- read-only voices folder (POSIX): nothing is written and the voice survives
+        if os.name == "posix" and os.geteuid() != 0:
+            folder, before = make_old()
+            os.remove(os.path.join(root, ".voices.lock"))   # a fresh folder has no lock file yet: that must not leak a raw error
+            os.chmod(root, 0o555)
+            try:
+                try:
+                    replace()
+                    raise AssertionError("expected a permission failure")
+                except vl.VoiceSaveError as exc:
+                    assert "Nothing was changed" in str(exc) or "existing voice is unchanged" in str(exc), exc
+            finally:
+                os.chmod(root, 0o755)
+            assert _snapshot_tree(folder) == before and vl.list_voices(root) == ["Ana"]
+    finally:
+        os.chmod(root, 0o755)
+        shutil.rmtree(root, ignore_errors=True)
+    print("PASS: voice replacement is failure-safe")
+
+
+def _test_clone_reports_how_many_chunks_it_planned():
+    """The UI tells a real early stop from a Stop pressed after the last chunk by comparing with clone_chunks."""
+    import numpy as np
+    import tts_generator
+
+    class Model:
+        def create_voice_clone_prompt(self, **kw):
+            return ["prompt"]
+
+        def generate_voice_clone(self, **kw):
+            return [np.zeros(240, dtype=np.float32)], 24000
+
+    class Models:
+        def get(self, kind, notify=None):
+            return Model()
+
+    text = "One two three. Four five six. Seven eight nine."
+    seen = []
+    generator = tts_generator.TTSGenerator(Models(), notify=seen.append)
+    out, sr = generator.clone(text=text, language="english", min_words=1, max_words=3, ref_audio="x", ref_text="t")
+    assert generator.clone_chunks == len(out) == len([m for m in seen if m.startswith("Chunk ")]) and len(out) >= 2
+    planned = generator.clone_chunks
+    stop = {"after": 1}
+    stopper = tts_generator.TTSGenerator(Models(), notify=seen.append, should_stop=lambda: len(seen) > stop["after"] + 3)
+    out2, _ = stopper.clone(text=text, language="english", min_words=1, max_words=3, ref_audio="x", ref_text="t")
+    assert stopper.clone_chunks == planned and len(out2) < planned, "an early stop returns fewer chunks than planned"
+    print("PASS: clone reports how many chunks it planned, so a real early stop can be told from a completed one")
 
 
 def _test_emotion_tags_and_seed():
@@ -980,6 +1272,8 @@ def run_tests():
     _test_f5_generation_and_worker()
     _test_engine_model_lifecycle()
     _test_voice_library_roundtrip()
+    _test_voice_replace_is_failure_safe()
+    _test_clone_reports_how_many_chunks_it_planned()
     _test_emotion_tags_and_seed()
     _test_benchmark_helpers()
     print("All tests passed.")

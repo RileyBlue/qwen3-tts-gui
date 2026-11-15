@@ -8,6 +8,7 @@ Generation paths run against a stub model, with playback and the output folder p
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -20,7 +21,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtTest import QTest
 
 import audio_player
-from audio_utils import load_wav
+from audio_utils import load_wav, write_wav
 import qt_app
 import icons
 import theme
@@ -1807,7 +1808,7 @@ def _test_stale_sample_callout_and_footer_status():
 _USED_ICONS = {"wand-sparkles", "copy", "mic-vocal", "book-open", "settings", "audio-lines", "play", "save",
                "download", "refresh-cw", "chevron-right", "chevron-down",
                "square", "folder-open", "circle-check", "circle-exclamation-point",
-               "pause", "rotate-ccw", "rotate-cw", "pencil"}
+               "pause", "rotate-ccw", "rotate-cw", "pencil", "info"}
 
 
 def _test_icon_assets_are_vendored_licensed_and_only_the_used_ones():
@@ -2117,6 +2118,10 @@ def _focus_label(w):
         return w.text()
     if isinstance(w, QtWidgets.QComboBox):
         return "combo:" + w.currentText()
+    if isinstance(w, QtWidgets.QAbstractSpinBox):
+        return w.accessibleName()
+    if isinstance(w, QtWidgets.QLineEdit) and isinstance(w.parent(), QtWidgets.QAbstractSpinBox):
+        return w.parent().accessibleName()   # a spin box's editor is its inner line edit
     if isinstance(w, (QtWidgets.QPlainTextEdit, QtWidgets.QLineEdit)):
         return w.accessibleName()
     return "?" + type(w).__name__
@@ -2442,6 +2447,1090 @@ def _test_set_role_updates_property():
     print("PASS: set_role sets the dynamic property")
 
 
+class _Library:
+    """A throwaway voices folder so Clone Voice tests never touch the real library."""
+
+    def __enter__(self):
+        self.original = voice_library.VOICES_DIR
+        voice_library.VOICES_DIR = tempfile.mkdtemp()
+        return self
+
+    def __exit__(self, *exc):
+        voice_library.VOICES_DIR = self.original
+
+    @staticmethod
+    def add(name, description="Warm narrator", language="german"):
+        path = voice_library.voice_dir(name)
+        os.makedirs(path)
+        with open(os.path.join(path, "voice.json"), "w") as f:
+            json.dump({"name": name, "description": description, "language": language, "seed": 7,
+                       "created": "x", "clone_prompt": "clone_prompt.npz"}, f)
+        np.savez(os.path.join(path, "clone_prompt.npz"), **{"0": np.array({"k": 1}, dtype=object)})
+        return path
+
+
+class _CloneCapture:
+    """Replaces the clone call so the test sees exactly what generation would receive."""
+
+    def __enter__(self):
+        self.calls = []
+        self.original = qt_app.TTSGenerator.clone
+        calls = self.calls
+
+        def clone(gen, **kwargs):
+            calls.append(kwargs)
+            return [np.zeros(2400, dtype=np.float32)], 24000
+        qt_app.TTSGenerator.clone = clone
+        return self
+
+    def __exit__(self, *exc):
+        qt_app.TTSGenerator.clone = self.original
+
+
+def _clone_window(models=None):
+    win, stub = _make_window(models=models)
+    win.show_page(1)
+    return win, stub
+
+
+def _fill_every_clone_field(win, wav="/tmp/ref.wav", npz="/tmp/p.npz"):
+    win.edt_vc_ref.setText(wav)
+    win.txt_vc_ref_text.setPlainText("Words in the recording")
+    win.chk_vc_xvec.setChecked(False)
+    win.edt_vc_reuse.setText(npz)
+    win.edt_vc_save.setText("/tmp/out.npz")
+    win.txt_vc_instruct.setPlainText("A custom description")
+
+
+def _test_clone_sources_are_exclusive_and_only_the_active_one_is_sent():
+    with _Patched(), _Library() as lib, _CloneCapture() as cap:
+        lib.add("Ada")
+        files = tempfile.mkdtemp()
+        wav, npz = os.path.join(files, "ref.wav"), os.path.join(files, "p.npz")
+        open(wav, "wb").close()
+        open(npz, "wb").close()
+        win, _ = _clone_window(models=_FakeModels())
+        win.refresh_voice_lists()
+        _fill_every_clone_field(win, wav, npz)
+        assert win.clone_source_kind() == "saved" and win.btn_vc_src_saved.isChecked()
+        win.cmb_vc_voice.setCurrentIndex(0)
+        win.btn_vc_generate.click()
+        _wait_idle(win)
+        sent = cap.calls[-1]
+        assert sent["voice_name"] == "Ada" and sent["ref_audio"] == "" and sent["ref_text"] is None
+        assert sent["reuse_prompt"] is None and sent["x_vector_only"] is False
+        assert sent["description"] == "", "a saved voice's description comes from the voice, not the form"
+        assert sent["save_prompt"] == "/tmp/out.npz", "exporting the prompt is an output option, not a source"
+
+        win.btn_vc_src_ref.setChecked(True)
+        assert win.clone_source_kind() == "reference"
+        win.btn_vc_generate.click()
+        _wait_idle(win)
+        sent = cap.calls[-1]
+        assert sent["voice_name"] is None and sent["reuse_prompt"] is None
+        assert sent["ref_audio"] == wav and sent["ref_text"] == "Words in the recording"
+        assert sent["description"] == "A custom description"
+        win.chk_vc_xvec.setChecked(True)
+        win.btn_vc_generate.click()
+        _wait_idle(win)
+        sent = cap.calls[-1]
+        assert sent["x_vector_only"] is True and sent["ref_text"] is None, "X-vector sends no transcript"
+
+        win.chk_vc_npz.setChecked(True)
+        assert win.clone_source_kind() == "prompt"
+        assert not win.edt_vc_ref.isEnabled() and not win.txt_vc_ref_text.isEnabled()
+        assert win.row_vc_reuse.isEnabled() and not win.btn_vc_save_voice.isEnabled()
+        win.btn_vc_generate.click()
+        _wait_idle(win)
+        sent = cap.calls[-1]
+        assert sent["reuse_prompt"] == npz and sent["ref_audio"] == "" and sent["voice_name"] is None
+        assert sent["ref_text"] is None and sent["x_vector_only"] is False
+        # switching modes keeps the other mode's entries
+        win.btn_vc_src_saved.setChecked(True)
+        assert win.edt_vc_ref.text() == wav and win.edt_vc_reuse.text() == npz
+        assert win.cmb_vc_voice.currentText() == "Ada"
+        win.close()
+    print("PASS: Clone Voice sends only the explicitly active source; the others are kept but never sent")
+
+
+def _test_clone_validation_runs_before_any_model_loads():
+    with _Patched(), _Library() as lib:
+        lib.add("Ada")
+        lib.add("Mute", description="")
+        files = tempfile.mkdtemp()
+        wav, npz = os.path.join(files, "ref.wav"), os.path.join(files, "p.npz")
+        mp3 = os.path.join(files, "ref.mp3")
+        for p in (wav, mp3):
+            open(p, "wb").close()
+        np.savez(npz, a=np.zeros(1))   # a dict-style prompt, not a list
+        win, stub = _clone_window()
+        win.refresh_voice_lists()
+
+        def expect(fragment, field=None, tags=False):
+            win.btn_vc_generate.click()
+            assert not win.busy, "validation must stop the run"
+            assert stub.calls == [], f"a model was loaded: {stub.calls}"
+            assert not win.lbl_vc_error.isHidden() and fragment in win.lbl_vc_error.text(), win.lbl_vc_error.text()
+            assert win.lbl_vc_error.text() in win.lbl_status.text()
+            if field is not None:
+                assert _app.focusWidget() is field, (_focus_label(_app.focusWidget()), fragment)
+
+        _shown(win)
+        win.txt_vc_text.setPlainText("   ")
+        expect("Enter the text", win.txt_vc_text)
+        win.txt_vc_text.setPlainText("Hello")
+        assert win.lbl_vc_error.isHidden(), "editing clears the stale problem"
+        win.cmb_vc_voice.setCurrentIndex(-1)
+        expect("Choose a saved voice", win.cmb_vc_voice)
+        win.cmb_vc_voice.setCurrentText("Mute")
+        win.txt_vc_text.setPlainText("[happy] Hello")
+        expect("no saved description", win.txt_vc_text)
+        win.txt_vc_text.setPlainText("Hello")
+        win.btn_vc_src_ref.setChecked(True)
+        expect("Choose a reference recording", win.edt_vc_ref)
+        win.edt_vc_ref.setText(wav + ".missing")
+        expect("not found", win.edt_vc_ref)
+        win.edt_vc_ref.setText(wav)
+        expect("transcript", win.txt_vc_ref_text)
+        win.txt_vc_ref_text.setPlainText("Words")
+        win.txt_vc_text.setPlainText("[sad] Hello")
+        win.btn_vc_advanced.setChecked(False)
+        expect("Describe the voice", win.txt_vc_instruct)
+        assert win.txt_vc_instruct.isVisible() and not win.btn_vc_advanced.isChecked(), \
+            "the description sits beside Save as voice, so no hidden section needs to open"
+        win.txt_vc_instruct.setPlainText("Warm")
+        win.chk_vc_npz.setChecked(True)
+        win.edt_vc_reuse.clear()
+        expect("Choose a prompt file", win.edt_vc_reuse)
+        win.edt_vc_reuse.setText(npz + ".missing")
+        expect("not found", win.edt_vc_reuse)
+        win.edt_vc_reuse.setText(npz)
+        expect("saved as a list", win.edt_vc_reuse)
+        win.chk_vc_npz.setChecked(False)
+        # saving a voice has its own pre-flight checks
+        win.edt_vc_new_name.setText("New")
+        win.edt_vc_ref.setText(mp3)
+        win.btn_vc_save_voice.click()
+        assert not win.busy and stub.calls == [] and "WAV" in win.lbl_vc_error.text()
+        win.edt_vc_ref.setText(wav)
+        win.txt_vc_ref_text.clear()
+        win.btn_vc_save_voice.click()
+        assert not win.busy and stub.calls == [] and "transcript" in win.lbl_vc_error.text()
+        win.edt_vc_new_name.setText("!!!")
+        win.btn_vc_save_voice.click()
+        assert "name" in win.lbl_vc_error.text() and stub.calls == []
+        win.close()
+    print("PASS: Clone Voice checks text, source, files, transcript and tags before any model is loaded")
+
+
+def _clone_ready_to_save(files):
+    wav = os.path.join(files, "ref.wav")
+    write_wav(wav, np.zeros(2400, dtype=np.float32), 24000)
+    return wav
+
+
+def _answer_box(label):
+    """Make the next QMessageBox choose the button with this text; returns the list of seen texts."""
+    seen = []
+    original = QtWidgets.QMessageBox.exec
+
+    def fake(box):
+        seen.append((box.text(), box.informativeText()))
+        for b in box.buttons():
+            if b.text() == label:
+                b.click()
+        return 0
+    QtWidgets.QMessageBox.exec = fake
+    return seen, lambda: setattr(QtWidgets.QMessageBox, "exec", original)
+
+
+def _test_save_clone_never_overwrites_silently():
+    with _Patched(), _Library() as lib:
+        folder = lib.add("Ana B")
+        os.makedirs(os.path.join(folder, "emotions"))
+        marker = os.path.join(folder, "emotions", "abc.npz")
+        open(marker, "w").close()
+        stray = os.path.join(voice_library.VOICES_DIR, "Plain_Folder")
+        os.makedirs(stray)
+        files = tempfile.mkdtemp()
+        wav = _clone_ready_to_save(files)
+        saved = []
+        real_save = voice_library.save_voice
+        voice_library.save_voice = lambda *a, **k: saved.append(k.get("overwrite")) or {}
+        try:
+            win, stub = _clone_window(models=_FakeModels())
+            win.btn_vc_src_ref.setChecked(True)
+            win.edt_vc_ref.setText(wav)
+            win.txt_vc_ref_text.setPlainText("Words")
+            # same slug as an existing voice ("Ana_B"): must ask, and Cancel leaves everything intact
+            win.edt_vc_new_name.setText("Ana_B")
+            seen, restore = _answer_box("Cancel")
+            try:
+                win.btn_vc_save_voice.click()
+            finally:
+                restore()
+            assert not win.busy and saved == [] and os.path.exists(marker), "cancel must leave the voice alone"
+            assert seen and "Ana B" in seen[0][0] and "1 cached emotion sample" in seen[0][1], seen
+            assert "share the folder" in seen[0][1] and "stays as it is" in seen[0][1], seen   # "Ana_B" vs "Ana B"
+            # a stray folder without voice.json is never replaced, and nothing asks to
+            win.edt_vc_new_name.setText("Plain Folder")
+            seen, restore = _answer_box("Replace")
+            try:
+                win.btn_vc_save_voice.click()
+            finally:
+                restore()
+            assert seen == [] and saved == [] and os.path.isdir(stray)
+            assert "isn't a voice" in win.lbl_vc_error.text()
+            # only an explicit Replace passes overwrite=True
+            win.edt_vc_new_name.setText("Ana B")
+            seen, restore = _answer_box("Replace")
+            try:
+                win.btn_vc_save_voice.click()
+                _wait_idle(win)
+            finally:
+                restore()
+            assert saved == [True]
+            # a free name never asks
+            win.edt_vc_new_name.setText("Brand New")
+            seen, restore = _answer_box("Cancel")
+            try:
+                win.btn_vc_save_voice.click()
+                _wait_idle(win)
+            finally:
+                restore()
+            assert seen == [] and saved == [True, False]
+            win.close()
+        finally:
+            voice_library.save_voice = real_save
+    print("PASS: Save as voice asks before replacing, cancels cleanly, protects non-voice folders, and decides on the GUI thread")
+
+
+def _test_save_clone_does_not_ask_while_a_task_is_running():
+    with _Patched(), _Library() as lib:
+        lib.add("Ana")
+        files = tempfile.mkdtemp()
+        wav = _clone_ready_to_save(files)
+        win, _ = _clone_window(models=_FakeModels())
+        win.btn_vc_src_ref.setChecked(True)
+        win.edt_vc_ref.setText(wav)
+        win.txt_vc_ref_text.setPlainText("Words")
+        win.edt_vc_new_name.setText("Ana")
+        seen, restore = _answer_box("Replace")
+        try:
+            win.busy = True
+            win.btn_vc_save_voice.click()
+            win.busy = False
+        finally:
+            restore()
+        assert seen == [], "no Replace dialog while another task is running"
+        assert "Busy" in win.lbl_status.text()
+        win.close()
+    print("PASS: Save as voice does not show the Replace dialog while a task is running")
+
+
+def _test_clone_voice_list_refresh_keeps_selection_language_and_has_no_blank_mode():
+    with _Patched(), _Library() as lib:
+        lib.add("Ada", language="german")
+        lib.add("Bo", language="french")
+        win, _ = _clone_window(models=_FakeModels())
+        win.refresh_voice_lists()
+        assert [win.cmb_vc_voice.itemText(i) for i in range(win.cmb_vc_voice.count())] == ["Ada", "Bo"]
+        assert win.cmb_vc_voice.currentIndex() == -1 and win._selected_clone_voice() is None
+        win.cmb_vc_lang.setCurrentText("english")
+        win.cmb_vc_voice.setCurrentIndex(1)
+        assert win.cmb_vc_lang.currentText() == "french", "choosing a voice prefills Language"
+        assert "french" in win.lbl_vc_voice_desc.text() or "Warm narrator" in win.lbl_vc_voice_desc.text()
+        win.cmb_vc_lang.setCurrentText("spanish")          # the user may still override it
+        win.refresh_voice_lists()
+        assert win.cmb_vc_voice.currentText() == "Bo", "refresh keeps the chosen voice"
+        assert win.cmb_vc_lang.currentText() == "spanish", "refresh must not overwrite the user's Language"
+        assert win.txt_vc_instruct.toPlainText() == "", "a saved voice never writes into the description box"
+        shutil.rmtree(voice_library.voice_dir("Bo"))
+        win.refresh_voice_lists()
+        assert win._selected_clone_voice() is None and win.cmb_vc_lang.currentText() == "spanish"
+        shutil.rmtree(voice_library.voice_dir("Ada"))
+        win.refresh_voice_lists()
+        assert not win.lbl_vc_empty.isHidden() and win.cmb_vc_voice.count() == 0
+        win.close()
+    print("PASS: refreshing the voice list keeps the selection and Language, and there is no hidden blank mode")
+
+
+class _PromptModels:
+    """Builds a clone prompt that can really be written to a voice folder."""
+
+    def get(self, kind, notify=None):
+        class M:
+            def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+                return {"a": np.zeros(1)}
+        return M()
+
+
+def _test_save_clone_offers_to_use_the_voice_without_switching():
+    with _Patched(), _Library():
+        files = tempfile.mkdtemp()
+        wav = _clone_ready_to_save(files)
+        win, _ = _clone_window(models=_PromptModels())
+        win.btn_vc_src_ref.setChecked(True)
+        win.edt_vc_ref.setText(wav)
+        win.txt_vc_ref_text.setPlainText("Words")
+        win.edt_vc_new_name.setText("Cleo")
+        assert win.row_vc_use.isHidden()
+        win.btn_vc_save_voice.click()
+        _wait_idle(win)
+        assert voice_library.voice_exists("Cleo")
+        assert win.clone_source_kind() == "reference", "saving must not switch the source"
+        assert not win.row_vc_use.isHidden() and "Cleo" in win.btn_vc_use_saved.text()
+        assert win.cmb_vc_voice.count() == 1 and win._selected_clone_voice() is None
+        win.btn_vc_use_saved.click()
+        assert win.clone_source_kind() == "saved" and win._selected_clone_voice() == "Cleo"
+        assert win.row_vc_use.isHidden()
+        win.close()
+    print("PASS: after Save as voice the source stays Reference audio and 'Use' is an explicit action")
+
+
+def _tree(path):
+    out = {}
+    for base, dirs, names in os.walk(path):
+        for d in dirs:
+            out[os.path.relpath(os.path.join(base, d), path) + "/"] = b""
+        for n in names:
+            with open(os.path.join(base, n), "rb") as f:
+                out[os.path.relpath(os.path.join(base, n), path)] = f.read()
+    return out
+
+
+def _test_failed_replace_keeps_the_existing_voice_and_says_so():
+    with _Patched(), _Library() as lib:
+        folder = lib.add("Ana B")
+        os.makedirs(os.path.join(folder, "emotions"))
+        with open(os.path.join(folder, "emotions", "abc.npz"), "wb") as f:
+            f.write(b"cache")
+        before = _tree(folder)
+        files = tempfile.mkdtemp()
+        wav = _clone_ready_to_save(files)
+        win, _ = _clone_window(models=_PromptModels())
+        win.btn_vc_src_ref.setChecked(True)
+        win.edt_vc_ref.setText(wav)
+        win.txt_vc_ref_text.setPlainText("Words")
+        win.edt_vc_new_name.setText("Ana B")
+        real = voice_library.write_wav
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+        voice_library.write_wav = boom
+        seen, restore = _answer_box("Replace")
+        try:
+            win.btn_vc_save_voice.click()
+            _wait_idle(win)
+        finally:
+            restore()
+            voice_library.write_wav = real
+        assert seen and "stays as it is" in seen[0][1]
+        assert _tree(folder) == before, "a failed write must leave the voice byte-identical"
+        assert not win.busy and "disk full" in win.lbl_vc_error.text() and "existing voice is unchanged" in win.lbl_vc_error.text() and not win.lbl_vc_error.isHidden()
+        assert win.row_vc_use.isHidden(), "nothing was saved, so there is nothing to use"
+        assert voice_library.list_voices() == ["Ana B"]
+        # the same click now succeeds through the real save: old assets are gone, one voice remains
+        seen, restore = _answer_box("Replace")
+        try:
+            win.btn_vc_save_voice.click()
+            _wait_idle(win)
+        finally:
+            restore()
+        assert not win.busy and not win.lbl_vc_error.text().startswith("Couldn't"), win.lbl_vc_error.text()
+        assert not os.path.exists(os.path.join(folder, "emotions")), "assets of the old recording are dropped"
+        assert os.path.isfile(os.path.join(folder, "reference.wav")) and os.path.isfile(os.path.join(folder, "clone_prompt.npz"))
+        assert voice_library.list_voices() == ["Ana B"] and not os.path.exists(os.path.join(voice_library.VOICES_DIR, ".pending"))
+        assert not win.row_vc_use.isHidden()
+        # Create Voice shares the same confirmation and the same non-voice-folder guard
+        stray = os.path.join(voice_library.VOICES_DIR, "Plain_Folder")
+        os.makedirs(stray)
+        win.pending_voice = {"wav": np.zeros(2400, dtype=np.float32), "sr": 24000, "description": "d",
+                             "language": "english", "seed": 3, "text": "Hi", "preview": wav}
+        win.edt_vd_name.setText("Plain Folder")
+        seen, restore = _answer_box("Replace")
+        try:
+            win.save_voice()
+        finally:
+            restore()
+        assert seen == [] and not win.busy and os.path.isdir(stray) and "isn't a voice" in win.lbl_vd_notice.text()
+        after = _tree(folder)
+        win.edt_vd_name.setText("Ana_B")
+        seen, restore = _answer_box("Cancel")
+        try:
+            win.save_voice()
+        finally:
+            restore()
+        assert seen and "its recording and clone prompt" in seen[0][1] and _tree(folder) == after and not win.busy
+        win.close()
+    print("PASS: a failed or cancelled replace leaves the existing voice untouched (Clone and Create Voice)")
+
+
+def _test_numeric_fields_share_one_style_and_keep_their_behavior():
+    with _Patched(), _Library():
+        win, _ = _clone_window(models=_FakeModels())
+        at = win.audiobook_tab
+        # (spin, min, max, step, default, suffix, neighbouring combo, page index) taken from the code before the restyle
+        specs = [
+            ("Create seed", win.spn_vd_seed, 0, 2**31 - 1, 1, 42, "", win.cmb_vd_seed_mode, 0),
+            ("Clone seed", win.spn_vc_seed, 0, 2**31 - 1, 1, 42, "", win.cmb_vc_seed_mode, 1),
+            ("Clone temperature", win.spn_vc_temp, 0.1, 1.5, 0.05, 0.7, "", win.cmb_vc_seed_mode, 1),
+            ("Audiobook pause", at.spn_pause, 0, 5000, 50, 350, " ms", at.cmb_seed_mode, 3),
+            ("Audiobook seed", at.spn_seed, 0, 2**31 - 1, 1, 42, "", at.cmb_seed_mode, 3),
+            ("Audiobook temperature", at.spn_temp, 0.1, 1.5, 0.05, 0.7, "", at.cmb_seed_mode, 3),
+            ("Min words", win.spn_min, 0, 5000, 1, 200, "", win.cmb_device, 4),
+            ("Max words", win.spn_max, 0, 5000, 1, 250, "", win.cmb_device, 4),
+        ]
+        win.resize(1240, 780)
+        win.show()
+        win.btn_vc_advanced.setChecked(True)
+        checked = []
+        for label, spin, lo, hi, step, default, suffix, neighbour, page in specs:
+            assert spin.property("role") == "numeric", label
+            assert spin.minimum() == lo and spin.maximum() == hi and abs(spin.singleStep() - step) < 1e-9, label
+            assert abs(spin.value() - default) < 1e-9 and spin.suffix() == suffix, label
+            assert spin.accessibleName(), f"{label} needs an accessible name"
+            win.show_page(page)
+            if page == 0:
+                win.btn_vd_advanced.setChecked(True)
+            _app.processEvents()
+            original_mode = neighbour.currentText() if neighbour.findText("Fixed") >= 0 else None
+            if original_mode:
+                neighbour.setCurrentText("Fixed")   # a Random seed is disabled by design
+            if spin.isVisible():
+                checked.append(label)
+                assert spin.height() == neighbour.height(), f"{label}: {spin.height()} vs {neighbour.height()}"
+                shown = spin.text()
+                assert spin.lineEdit().fontMetrics().horizontalAdvance(shown) + 20 <= spin.width(), f"{label} clips '{shown}'"
+                # same keyboard behaviour as before: Up/Down step by the same amount, typing replaces the value
+                spin.setFocus()
+                _app.processEvents()
+                start = spin.value()
+                QTest.keyClick(spin, QtCore.Qt.Key_Up)
+                assert abs(spin.value() - (start + step)) < 1e-9, label
+                QTest.keyClick(spin, QtCore.Qt.Key_Down)
+                assert abs(spin.value() - start) < 1e-9, label
+                spin.selectAll()
+                QTest.keyClicks(spin, str(hi))
+                QTest.keyClick(spin, QtCore.Qt.Key_Tab)
+                assert abs(spin.value() - hi) < 1e-9, label
+                assert spin.lineEdit().fontMetrics().horizontalAdvance(spin.text()) + 20 <= spin.width(), \
+                    f"{label} clips its widest value '{spin.text()}'"
+                spin.setValue(default)
+            if original_mode:
+                neighbour.setCurrentText(original_mode)
+        assert len(checked) == len(specs), f"these were never shown, so never measured: {set(l[0] for l in specs) - set(checked)}"
+        # the widest values still fit
+        win.show_page(1)
+        win.cmb_vc_seed_mode.setCurrentText("Fixed")
+        win.spn_vc_seed.setValue(2**31 - 1)
+        _app.processEvents()
+        assert win.spn_vc_seed.lineEdit().fontMetrics().horizontalAdvance(win.spn_vc_seed.text()) + 20 <= win.spn_vc_seed.width()
+        win.spn_vc_seed.setValue(42)
+        # Random disables the value but keeps it
+        win.cmb_vc_seed_mode.setCurrentText("Random")
+        assert not win.spn_vc_seed.isEnabled() and win.spn_vc_seed.value() == 42
+        win.close()
+    print("PASS: every numeric field shares one style and keeps its range, step, default and keyboard behavior")
+
+
+def _test_clone_save_records_the_real_seed_transcript_and_description():
+    with _Patched(), _Library():
+        files = tempfile.mkdtemp()
+        wav = _clone_ready_to_save(files)
+        win, _ = _clone_window(models=_PromptModels())
+        win.btn_vc_src_ref.setChecked(True)
+        win.edt_vc_ref.setText(wav)
+
+        def save(name, **setup):
+            win.edt_vc_new_name.setText(name)
+            win.btn_vc_save_voice.click()
+            _wait_idle(win)
+            with open(os.path.join(voice_library.voice_dir(name), "voice.json"), encoding="utf-8") as f:
+                return json.load(f)
+
+        # exact transcript, fixed seed and the single description field are stored as given
+        win.txt_vc_ref_text.setPlainText("  Exactly these words.  ")
+        win.txt_vc_instruct.setPlainText("Warm and slow")
+        win.cmb_vc_seed_mode.setCurrentText("Fixed")
+        win.spn_vc_seed.setValue(1234)
+        cfg = save("Fixed Voice")
+        assert cfg["seed"] == 1234 and cfg["description"] == "Warm and slow"
+        assert cfg["ref_text"] == cfg["sample_text"] == "Exactly these words."
+        # Random records 0: that is what clone() uses for [tag] emotion samples in Reference mode (`seed or 0`),
+        # so the saved voice reproduces what the user heard. Nothing is invented at save time.
+        win.cmb_vc_seed_mode.setCurrentText("Random")
+        assert win.clone_args()["seed"] is None
+        cfg = save("Random Voice")
+        assert cfg["seed"] == 0
+        # X-vector only: the transcript is explicitly empty, not the standard passage; description may be empty
+        win.chk_vc_xvec.setChecked(True)
+        win.txt_vc_instruct.clear()
+        cfg = save("Xvec Voice")
+        assert cfg["ref_text"] == "" and cfg["sample_text"] == "" and cfg["description"] == ""
+        win.close()
+        # library default is unchanged: no transcript argument means the standard passage
+        root = tempfile.mkdtemp()
+        cfg = voice_library.save_voice("Std", np.zeros(2400, dtype=np.float32), 24000, {"k": np.zeros(1)},
+                                       "d", "english", 1, root=root)
+        assert cfg["ref_text"] == voice_library.SAMPLE_TEXT
+    print("PASS: Save as voice records the seed clone() really uses, the exact transcript (empty for X-vector) and one description")
+
+
+def _test_import_voice_from_audio_stores_an_empty_transcript_and_no_invented_seed():
+    with _Patched(), _Library():
+        files = tempfile.mkdtemp()
+        wav = _clone_ready_to_save(files)
+        win, _ = _clone_window(models=_PromptModels())
+        patches = {
+            (QtWidgets.QFileDialog, "getOpenFileName"): lambda *a, **k: (wav, ""),
+            (QtWidgets.QInputDialog, "getText"): lambda *a, **k: ("Imported", True),
+            (QtWidgets.QInputDialog, "getItem"): lambda *a, **k: ("english", True),
+            (QtWidgets.QInputDialog, "getMultiLineText"): lambda *a, **k: ("Warm", True),
+            (QtWidgets.QInputDialog, "getInt"): lambda *a, **k: (0, True),   # 0 = random, resolved before the work starts
+        }
+        originals = {key: getattr(*key) for key in patches}
+        for (cls, name), fn in patches.items():
+            setattr(cls, name, staticmethod(fn))
+        real = qt_app.random.randint
+        qt_app.random.randint = lambda a, b: 4242
+        try:
+            win.create_voice_from_audio()
+            _wait_idle(win)
+        finally:
+            qt_app.random.randint = real
+            for (cls, name), fn in originals.items():
+                setattr(cls, name, fn)
+        with open(os.path.join(voice_library.voice_dir("Imported"), "voice.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+        assert cfg["ref_text"] == "" and cfg["sample_text"] == "" and cfg["description"] == "Warm"
+        assert cfg["seed"] == 4242, "a seed picked before the work and recorded as picked"
+        win.close()
+    print("PASS: importing a voice from audio stores an explicitly empty transcript")
+
+
+class _FakeSession:
+    """audio_player with a pretend playback session, so Play / Pause / seek can be driven without sound."""
+
+    NAMES = ("play", "stop", "pause", "resume", "seek", "state", "current_path", "position", "can_control")
+
+    def __enter__(self):
+        self.saved = {n: getattr(audio_player, n) for n in self.NAMES}
+        self.path, self.st, self.pos, self.played = None, "stopped", 0.0, []
+
+        def play(path, start=0.0):
+            self.played.append((path, start))
+            self.path, self.st, self.pos = path, "playing", start
+
+        def stop():
+            self.path, self.st, self.pos = None, "stopped", 0.0
+        audio_player.play, audio_player.stop = play, stop
+        audio_player.pause = lambda: setattr(self, "st", "paused")
+        audio_player.resume = lambda: setattr(self, "st", "playing")
+        audio_player.seek = lambda s: setattr(self, "pos", s)
+        audio_player.state = lambda: self.st
+        audio_player.current_path = lambda: self.path
+        audio_player.position = lambda: self.pos
+        audio_player.can_control = lambda: True
+        return self
+
+    def __exit__(self, *exc):
+        for n, fn in self.saved.items():
+            setattr(audio_player, n, fn)
+
+
+def _test_clone_preview_states_transitions_and_player():
+    import voice_library as _vl
+    with _Patched(), _Library() as lib, _FakeSession() as session:
+        lib.add("Ada")
+        win, _ = _clone_window(models=_FakeModels())
+        win.refresh_voice_lists()
+        win.cmb_vc_voice.setCurrentIndex(0)
+        _shown(win)
+        win.txt_vc_text.setPlainText("Hello there")
+        seen_while_running, seen_state = [], []
+        mode = {"kind": "ok"}
+        original = qt_app.TTSGenerator.clone
+
+        def clone(gen, **kwargs):
+            seen_while_running.append((win._vc_pv_state, win.vc_player.isVisible(), win.vc_player.has_audio()))
+            seen_state.append(session.st)
+            kind = mode["kind"]
+            if kind == "error":
+                raise ValueError("boom")
+            if kind == "flash":
+                raise ImportError("flash_attn is not installed")
+            if kind == "complete_stop":
+                gen.clone_chunks = 1
+                win.task.stop_event.set()                    # Stop pressed after the only chunk was already done
+                return [np.zeros(24000, dtype=np.float32) + 0.1], 24000
+            if kind == "midway":
+                gen.clone_chunks = 3
+                win.task.stop_event.set()                    # two of three chunks were made
+                return [np.zeros(24000, dtype=np.float32) + 0.1] * 2, 24000
+            if kind == "multi":
+                return [np.zeros(24000, dtype=np.float32), np.zeros(48000, dtype=np.float32) + 0.1,
+                        np.zeros(24000, dtype=np.float32)], 24000     # three chunks: the combined-file branch
+            if kind in ("partial", "stopped"):
+                win.task.stop_event.set()       # the user pressed Stop while it was running
+            if kind == "stopped":
+                return [], 24000
+            return [np.zeros(48000, dtype=np.float32) + 0.1], 24000   # 2 s
+        qt_app.TTSGenerator.clone = clone
+
+        def generate(kind):
+            mode["kind"] = kind
+            win.btn_vc_generate.click()
+            _wait_idle(win)
+
+        try:
+            player = win.vc_player
+            # EMPTY
+            assert win._vc_pv_state == qt_app.CV_EMPTY and not player.isVisible() and not player.has_audio()
+            assert "appear here" in win.lbl_vc_pv_title.text() and "Choose a voice" in win.lbl_vc_pv_detail.text()
+            # READY: file saved by the existing path, shown in the player, nothing plays by itself
+            generate("ok")
+            path = win.last_output
+            assert seen_while_running[-1] == (qt_app.CV_BUSY, False, False), "Generating shows no player"
+            assert win._vc_pv_state == qt_app.CV_READY and win.lbl_vc_pv_title.text() == "Audio ready"
+            assert player.isVisible() and player.path() == path and os.path.isfile(path)
+            assert abs(player.duration() - 2.0) < 0.01
+            assert player.lbl_len.text() == "0:02" and player.btn_play.text() == "Play" and not session.played
+            assert win.btn_play_last.isEnabled() and path in win.lbl_vc_pv_detail.text()
+            # the player owns its path: another screen changing last_output does not retarget it
+            win.last_output = "/elsewhere/render.wav"
+            assert player.path() == path
+            win.last_output = path
+            # Play / Pause / Resume, Back / Forward and the slider all follow the (fake) session
+            player.btn_play.click()
+            assert session.played == [(path, 0.0)] and player.btn_play.text() == "Pause"
+            win._refresh_audio_state()
+            assert not win.btn_stop_audio.isHidden(), "the footer Stop appears for the Preview's audio too"
+            player.btn_play.click()
+            assert session.st == "paused" and player.btn_play.text() == "Play" and "Resume" in player.btn_play.toolTip()
+            player.btn_forward.click()
+            assert abs(session.pos - 1.95) < 1e-6 and player.lbl_pos.text() == "0:02", (session.pos, player.lbl_pos.text())
+            player.btn_back.click()
+            assert abs(session.pos - 0.0) < 1e-6
+            player.wave.seek_requested.emit(0.5)
+            assert abs(session.pos - 1.0) < 1e-6
+            player.btn_play.click()
+            assert session.st == "playing"
+            # footer Stop resets everything the same way as for Create Voice
+            win.stop_audio()
+            assert session.st == "stopped" and player.btn_play.text() == "Play" and player.position() == 0.0
+            # keyboard: Generate -> Seek -> Back -> Play -> Forward, Space activates the focused button
+            win.btn_vc_generate.setFocus()
+            _app.processEvents()
+            order = []
+            for _ in range(4):
+                _tab()
+                order.append(_focus_label(_app.focusWidget()))
+            assert order == ["Seek", "Back 5 seconds", "Play", "Forward 5 seconds"], order
+            _tab(shift=True)
+            _tab(shift=True)
+            assert _focus_label(_app.focusWidget()) == "Back 5 seconds"
+            _tab()
+            assert _app.focusWidget() is player.btn_play
+            _press(QtCore.Qt.Key_Space)
+            assert session.st == "playing"
+            # GENERATING keeps the previous audio on screen and playable (as Create Voice keeps its last sample)
+            player.btn_play.setFocus()
+            generate("partial")
+            assert seen_while_running[-1] == (qt_app.CV_BUSY, True, True), seen_while_running[-1]
+            assert seen_state[-1] == "stopped", "playback ended when the generation started (as in Create Voice)"
+            # the new result replaces it, and the old audio stops with it
+            assert session.st == "stopped" and session.played[-1][0] == path
+            # PARTIAL: stopped early (fewer chunks than planned, or no count known), audio kept and playable
+            assert win._vc_pv_state == qt_app.CV_PARTIAL and win.lbl_vc_pv_title.text() == "Stopped early"
+            assert player.isVisible() and player.has_audio() and os.path.isfile(player.path()) and player.path() == win.last_output
+            assert "part generated so far" in win.lbl_vc_pv_detail.text() and win.lbl_vc_pv_prev.isHidden()
+            partial_path = player.path()
+            # STOPPED without audio: the previous audio is still there, labelled, and last_output is untouched
+            player.btn_play.setFocus()
+            generate("stopped")
+            assert win._vc_pv_state == qt_app.CV_STOPPED and player.isVisible() and player.path() == partial_path
+            assert win.lbl_vc_pv_title.text().startswith("Stopped before any audio")
+            assert "previous audio is still available" in win.lbl_vc_pv_detail.text() and not win.lbl_vc_pv_prev.isHidden()
+            assert win.last_output == partial_path and _app.focusWidget() is player.btn_play, "nothing vanished, so focus stays"
+            # no previous audio at all: nothing to keep, honest text, focus leaves the hidden controls
+            win._set_clone_preview(qt_app.CV_EMPTY)
+            assert not player.isVisible() and not player.has_audio()
+            generate("stopped")
+            assert win._vc_pv_state == qt_app.CV_STOPPED and not player.isVisible()
+            assert "Nothing was saved" in win.lbl_vc_pv_detail.text()
+            # Stop pressed after the final chunk: the output is complete, so it is Ready, not "Stopped early"
+            generate("complete_stop")
+            assert win.task.stop_event.is_set() and win._vc_pv_state == qt_app.CV_READY
+            assert win.lbl_vc_pv_title.text() == "Audio ready" and "Done. Audio saved to" in win.lbl_status.text()
+            # a real early stop (2 of 3 chunks) is reported as such, in the Preview and in the footer
+            generate("midway")
+            assert win._vc_pv_state == qt_app.CV_PARTIAL and "Stopped early; partial audio saved" in win.lbl_status.text()
+            # ERROR with previous audio: it stays, the message is sanitized and actionable, details are on request
+            generate("ok")
+            assert win._vc_pv_state == qt_app.CV_READY
+            ok_path = player.path()
+            generate("error")
+            detail = win.lbl_vc_pv_detail.text()
+            assert win._vc_pv_state == qt_app.CV_ERROR and player.isVisible() and player.path() == ok_path
+            assert win.lbl_vc_pv_title.text() == "Couldn't generate new audio" and not win.lbl_vc_pv_prev.isHidden()
+            assert "boom" not in detail and "ValueError" not in detail and "Traceback" not in detail, detail
+            assert detail.startswith("Something went wrong while generating the audio.") and "previous audio is still available" in detail
+            assert "boom" not in win.lbl_status.text() and "boom" not in win.lbl_vc_pv_title.text()
+            assert not win.btn_vc_details.isHidden() and win.btn_vc_error_settings.isHidden()
+            assert "ValueError" in win._clone_failure_details and "boom" in win._clone_failure_details and "Clone Voice audio" in win._clone_failure_details
+            assert "Qwen3-TTS-12Hz-1.7B-Base" in win._clone_failure_details and "Source: saved" in win._clone_failure_details
+            shown = []
+            real_exec = QtWidgets.QDialog.exec
+            QtWidgets.QDialog.exec = lambda d: shown.append([b.toPlainText() for b in d.findChildren(QtWidgets.QPlainTextEdit)]) or 0
+            try:
+                win.btn_vc_details.click()
+            finally:
+                QtWidgets.QDialog.exec = real_exec
+            assert shown and "boom" in shown[0][0] and "Clone Voice audio" in shown[0][0]
+            win._failure_details = "CREATE-ONLY DETAILS"
+            shown.clear()
+            QtWidgets.QDialog.exec = lambda d: shown.append([b.toPlainText() for b in d.findChildren(QtWidgets.QPlainTextEdit)]) or 0
+            try:
+                win.btn_vc_details.click()
+                win._open_failure_dialog()
+            finally:
+                QtWidgets.QDialog.exec = real_exec
+            assert "boom" in shown[0][0] and shown[1][0] == "CREATE-ONLY DETAILS", "each screen shows its own details"
+            win.copy_failure_details("clone text")
+            assert QtWidgets.QApplication.clipboard().text() == "clone text"
+            win._failure_details = ""
+            # focus on an error button that is about to disappear moves to a visible field
+            win.btn_vc_details.setFocus()
+            _app.processEvents()
+            assert _app.focusWidget() is win.btn_vc_details
+            generate("ok")
+            assert _app.focusWidget() is not None and _app.focusWidget().isVisible() and win.btn_vc_details.isHidden()
+            generate("error")
+            win.btn_vc_generate.setFocus()
+            order = []
+            for _ in range(7):
+                _tab()
+                order.append(_focus_label(_app.focusWidget()))
+            assert order[:2] == ["Show details", "Seek"], order
+            assert order.index("Show details") < order.index("Seek") < order.index("Back 5 seconds") < order.index("Play")
+            # a cause we can identify gets its own wording and the Settings shortcut
+            mode["kind"] = "flash"
+            generate("flash")
+            assert "FlashAttention" in win.lbl_vc_pv_detail.text() and not win.btn_vc_error_settings.isHidden()
+            # a fresh error with nothing before it shows no player
+            win._set_clone_preview(qt_app.CV_EMPTY)
+            generate("error")
+            assert win.lbl_vc_pv_title.text() == "Couldn't generate the audio" and not player.isVisible()
+            # a new success leaves no error controls behind
+            generate("ok")
+            assert win.btn_vc_details.isHidden() and win.btn_vc_error_settings.isHidden() and win.lbl_vc_pv_prev.isHidden()
+            # several chunks are combined into one file that the player reads back at the right length
+            generate("multi")
+            combined = player.path()
+            assert os.path.isfile(combined) and abs(player.duration() - 4.0) < 0.01 and player.lbl_len.text() == "0:04"
+            assert len(load_wav(combined)[0]) == 96000
+            assert player.wave.accessibleName() == "Waveform of the generated audio"
+            assert not [f for f in os.listdir(os.path.dirname(combined)) if re.fullmatch(r"VoiceClone_\d{8}_\d{6}_[0-9a-f]{3}_\d+\.wav", f)], "temp segments cleaned"
+            # a refused click while another task runs must leave the Ready preview alone
+            win.busy = True
+            win.generate_clone()
+            win.busy = False
+            assert win._vc_pv_state == qt_app.CV_READY and player.isVisible() and player.path() == combined
+            assert "Busy" in win.lbl_status.text()
+            # the detail line never keeps the height of a longer earlier message
+            win._set_clone_preview(qt_app.CV_STOPPED, "word " * 80)
+            _app.processEvents()
+            long_height = win.lbl_vc_pv_detail.height()
+            win._set_clone_preview(qt_app.CV_STOPPED, "short")
+            _app.processEvents()
+            assert win.lbl_vc_pv_detail.height() < long_height
+            # a failure while saving or reading the file must not leave the panel on "Generating"
+            real_save = qt_app.save_outputs
+            qt_app.save_outputs = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+            try:
+                generate("ok")
+            finally:
+                qt_app.save_outputs = real_save
+            assert not win.busy and win._vc_pv_state == qt_app.CV_ERROR and "disk full" not in win.lbl_vc_pv_detail.text()
+            assert "disk full" in win._clone_failure_details
+            # playback failure is reported in the panel and the footer, and the player stays usable
+            generate("ok")
+            audio_player.play = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no device"))
+            player.btn_play.click()
+            assert "no device" in win.lbl_vc_pv_detail.text() and win.lbl_status.text().startswith("Playback error")
+            assert player.btn_play.text() == "Play" and player.isVisible()
+        finally:
+            qt_app.TTSGenerator.clone = original
+            win.close()
+    print("PASS: Clone Preview shows Empty, Generating, Ready, Stopped early, Stopped without audio and Error with one shared player")
+
+
+def _test_create_and_clone_players_share_the_audio_session_without_crosstalk():
+    with _Patched(), _Library() as lib, _FakeSession() as session:
+        win, _ = _clone_window(models=_FakeModels())
+        _shown(win)
+        a, b = win.vd_player, win.vc_player
+        wav = np.zeros(24000, dtype=np.float32)
+        pa, pb = os.path.join(tempfile.mkdtemp(), "a.wav"), os.path.join(tempfile.mkdtemp(), "b.wav")
+        a.set_audio(pa, wav, 24000)
+        b.set_audio(pb, wav, 24000)
+        b.toggle()
+        assert b.state() == "playing" and a.state() == "stopped", "playing one screen's audio is not the other's"
+        a.toggle()       # starting the other player replaces the single session
+        assert a.state() == "playing" and b.state() == "stopped" and session.path == pa
+        b.clear()        # clearing a player that is not playing leaves the session alone
+        assert session.st == "playing" and session.path == pa
+        a.clear()
+        assert session.st == "stopped" and not a.has_audio() and not a.slider.isEnabled()
+        win.close()
+    print("PASS: the Create and Clone players share one audio session without controlling each other")
+
+
+def _test_transcript_editor_prefill_handles_missing_empty_and_real_ref_text():
+    with _Patched(), _Library():
+        win, _ = _clone_window(models=_FakeModels())
+        cases = {
+            "Old": {"name": "Old"},                                                    # voices saved before the change: no key
+            "Empty": {"name": "Empty", "ref_text": ""},                                # X-vector only: explicitly empty
+            "Real": {"name": "Real", "ref_text": "Exactly these words."},
+            "Own": {"name": "Own", "ref_text": "stored", "csm_ref_text": "the saved CSM transcript"},
+        }
+        expected = {"Old": "", "Empty": "", "Real": "Exactly these words.", "Own": "the saved CSM transcript"}
+        for name, cfg in cases.items():
+            os.makedirs(voice_library.voice_dir(name))
+            with open(os.path.join(voice_library.voice_dir(name), "voice.json"), "w", encoding="utf-8") as f:
+                json.dump(cfg, f)
+        asked = []
+        original = QtWidgets.QInputDialog.getMultiLineText
+        QtWidgets.QInputDialog.getMultiLineText = staticmethod(lambda *a, **k: (asked.append(a[3]) or ("", False)))
+        try:
+            for name in cases:
+                win.selected_voice_slug = lambda n=name: n
+                win.edit_csm_transcript()
+        finally:
+            QtWidgets.QInputDialog.getMultiLineText = original
+        assert asked == [expected[n] for n in cases], asked
+        win.close()
+    print("PASS: the transcript editor prefill handles a missing, an empty and a real ref_text")
+
+
+def _test_clone_layout_keyboard_and_disclosure():
+    with _Patched(), _Library() as lib:
+        lib.add("Ada")
+        win, _ = _clone_window(models=_FakeModels())
+        win.refresh_voice_lists()
+        for size in ((1240, 780), (1024, 640)):
+            win.resize(*size)
+            win.show()
+            _app.processEvents()
+            page = win.stack.widget(1)
+            for ref, adv in ((False, False), (True, False), (True, True)):
+                (win.btn_vc_src_ref if ref else win.btn_vc_src_saved).setChecked(True)
+                win.btn_vc_advanced.setChecked(adv)
+                _app.processEvents()
+                assert page.horizontalScrollBar().maximum() == 0, (size, ref, adv, "horizontal scrolling")
+                assert page.verticalScrollBar().maximum() >= 0
+            win.btn_vc_src_saved.setChecked(True)
+            win.btn_vc_advanced.setChecked(False)
+            _app.processEvents()
+            g = win.btn_vc_generate.mapTo(page.viewport(), QtCore.QPoint(0, 0)).y() + win.btn_vc_generate.height()
+            assert g <= page.viewport().height(), (size, "Generate is visible without scrolling", g)
+            win.btn_vc_generate.click()   # no voice chosen: the inline problem appears above Generate
+            _app.processEvents()
+            assert not win.lbl_vc_error.isHidden()
+            page.verticalScrollBar().setValue(0)
+            g = win.btn_vc_generate.mapTo(page.viewport(), QtCore.QPoint(0, 0)).y() + win.btn_vc_generate.height()
+            assert g <= page.viewport().height(), (size, "Generate stays visible with the problem shown", g)
+        assert not win.btn_vc_advanced.isChecked() and not win.vc_advanced.isVisible(), "Advanced starts collapsed"
+        assert win.btn_vc_advanced.accessibleDescription() == "Collapsed"
+        win.btn_vc_advanced.setChecked(True)
+        assert win.btn_vc_advanced.accessibleDescription() == "Expanded"
+        assert win.vc_advanced.isAncestorOf(win.cmb_vc_seed_mode) and win.vc_advanced.isAncestorOf(win.dir_vc)
+        assert win.vc_advanced.isAncestorOf(win.spn_vc_temp) and win.vc_advanced.isAncestorOf(win.edt_vc_save)
+        # keyboard: arrow keys move between the two source modes and select
+        win.btn_vc_src_saved.setFocus()
+        _press(QtCore.Qt.Key_Right)
+        assert win.btn_vc_src_ref.isChecked() and win.clone_source_kind() == "reference"
+        _press(QtCore.Qt.Key_Left)
+        assert win.btn_vc_src_saved.isChecked()
+        # the primary button comes before Advanced, as in Create Voice
+        generate_y = win.btn_vc_generate.mapTo(win, QtCore.QPoint(0, 0)).y()
+        assert generate_y < win.btn_vc_advanced.mapTo(win, QtCore.QPoint(0, 0)).y()
+        assert win.cmb_vc_voice.accessibleName() and win.txt_vc_text.accessibleName()
+        win.close()
+    print("PASS: Clone Voice fits both sizes without horizontal scrolling, Advanced is collapsed, and the keyboard works")
+
+
+
+def _hover(widget):
+    """Send the tooltip help event Qt sends after the mouse rests on a widget."""
+    qt_app.InfoPopup.hide_popup()
+    pos = QtCore.QPoint(widget.width() // 2, widget.height() // 2)
+    QtWidgets.QApplication.sendEvent(widget, QtGui.QHelpEvent(QtCore.QEvent.ToolTip, pos, widget.mapToGlobal(pos)))
+    _app.processEvents()
+
+
+def _test_clone_advanced_info_buttons_and_numeric_fields():
+    with _Patched(), _Library():
+        win, _ = _clone_window(models=_FakeModels())
+        _shown(win)
+        win.btn_vc_advanced.setChecked(True)
+        _app.processEvents()
+        topics = {"Seed": qt_app.SEED_TIP, "Temperature": qt_app.TEMPERATURE_TIP,
+                  "Direction tags": qt_app.DIRECTION_TAGS_TIP, "Description": qt_app.DESCRIPTION_TIP}
+        assert set(win.info_buttons) == set(topics)
+        for topic, tip in topics.items():
+            b = win.info_buttons[topic]
+            assert isinstance(b, qt_app.InfoButton) and b.property("role") == "info"
+            assert b.accessibleName() == f"About {topic}" and b.accessibleDescription() == tip
+            assert b.focusPolicy() != QtCore.Qt.NoFocus and not b.icon().isNull()
+            assert b.width() == 22 and b.height() == 22
+            assert tip in b.toolTip() and "<" not in tip, "plain text for assistive tech, rich text only for the tip"
+            _hover(b)   # mouse rests on it: the same bubble as the keyboard shows
+            assert qt_app.InfoPopup.is_open() and qt_app.InfoPopup.owner is b
+            assert qt_app.InfoPopup._shared.text() == tip, topic
+            QTest.mouseMove(win, QtCore.QPoint(2, 2))
+            b.leaveEvent(QtCore.QEvent(QtCore.QEvent.Leave))
+            assert not qt_app.InfoPopup.is_open(), "moving away hides it"
+            QTest.mouseClick(b, QtCore.Qt.LeftButton)   # a click shows it too; clicking again hides it
+            assert qt_app.InfoPopup.is_open() and qt_app.InfoPopup._shared.text() == tip, topic
+            QTest.mouseClick(b, QtCore.Qt.LeftButton)
+            b.clearFocus()
+            qt_app.InfoPopup.hide_popup()
+        # keyboard: Tab onto the info button shows the tip, Escape and Tab away hide it
+        seed_info = win.info_buttons["Seed"]
+        win.btn_vc_advanced.setFocus()
+        for _ in range(12):
+            _tab()
+            if _app.focusWidget() is seed_info:
+                break
+        assert _app.focusWidget() is seed_info, _focus_label(_app.focusWidget())
+        QTest.keyRelease(seed_info, QtCore.Qt.Key_Tab)   # the key's own release must not dismiss it
+        _app.processEvents()
+        assert qt_app.InfoPopup.is_open() and qt_app.InfoPopup._shared.text() == qt_app.SEED_TIP
+        assert qt_app.InfoPopup._shared.width() <= 300, "wrapped, not stretched"
+        assert win.rect().contains(win.mapFromGlobal(qt_app.InfoPopup._shared.geometry().topLeft())), "on screen"
+        _press(QtCore.Qt.Key_Escape)
+        assert not qt_app.InfoPopup.is_open()
+        _press(QtCore.Qt.Key_Space)
+        assert qt_app.InfoPopup.is_open(), "Space shows it again"
+        _tab()
+        assert not qt_app.InfoPopup.is_open(), "leaving the button hides the tip"
+        assert _app.focusWidget() is win.cmb_vc_seed_mode, _focus_label(_app.focusWidget())
+        # the checkboxes carry their own explanations instead of adding tab stops
+        win.btn_vc_src_ref.setChecked(True)
+        assert qt_app.XVECTOR_TIP in win.chk_vc_xvec.toolTip() and win.chk_vc_xvec.accessibleDescription()
+        assert "trust" in win.chk_vc_npz.toolTip() and win.chk_vc_npz.accessibleDescription()
+        win.btn_vc_src_saved.setChecked(True)
+
+        # numeric fields: same height and style as the other fields, no arrow buttons, ranges kept
+        for spin in (win.spn_vc_seed, win.spn_vc_temp):
+            assert spin.property("role") == "numeric"
+            assert spin.lineEdit().width() >= spin.width() - 24, "the stepper takes no room: the value has the whole field"
+            assert spin.fontMetrics().horizontalAdvance(spin.text()) <= spin.lineEdit().width(), "value fully visible"
+            assert spin.height() == win.cmb_vc_seed_mode.height() == win.cmb_vc_lang.height(), spin.height()
+        assert (win.spn_vc_seed.minimum(), win.spn_vc_seed.maximum()) == (0, 2**31 - 1)
+        assert (win.spn_vc_temp.minimum(), win.spn_vc_temp.maximum(), win.spn_vc_temp.singleStep()) == (0.1, 1.5, 0.05)
+        assert win.spn_vc_seed.value() == 42 and win.spn_vc_temp.value() == 0.7 and win.cmb_vc_seed_mode.currentText() == "Fixed"
+        win.spn_vc_seed.setValue(2**31 - 1)
+        assert win.spn_vc_seed.fontMetrics().horizontalAdvance(win.spn_vc_seed.text()) <= win.spn_vc_seed.lineEdit().width() - 10
+        win.spn_vc_seed.setValue(42)
+        # typing and arrow keys
+        win.spn_vc_temp.setFocus()
+        win.spn_vc_temp.selectAll()
+        QTest.keyClicks(win.spn_vc_temp.lineEdit(), "1.25")
+        _press(QtCore.Qt.Key_Tab)
+        assert abs(win.spn_vc_temp.value() - 1.25) < 1e-9
+        win.spn_vc_temp.setFocus()
+        _press(QtCore.Qt.Key_Up)
+        assert abs(win.spn_vc_temp.value() - 1.30) < 1e-9, "arrow keys still step by 0.05"
+        _press(QtCore.Qt.Key_Down)
+        _press(QtCore.Qt.Key_Down)
+        assert abs(win.spn_vc_temp.value() - 1.20) < 1e-9
+        win.spn_vc_temp.setValue(9)
+        assert win.spn_vc_temp.value() == 1.5
+        win.spn_vc_temp.setValue(0)
+        assert win.spn_vc_temp.value() == 0.1
+        win.spn_vc_temp.setFocus()
+        win.spn_vc_temp.selectAll()
+        QTest.keyClicks(win.spn_vc_temp.lineEdit(), "7")   # 7 is not an acceptable value: it never gets in
+        _press(QtCore.Qt.Key_Tab)
+        assert 0.1 <= win.spn_vc_temp.value() <= 1.5
+        win.spn_vc_seed.setFocus()
+        win.spn_vc_seed.selectAll()
+        QTest.keyClicks(win.spn_vc_seed.lineEdit(), "99999999999")
+        _press(QtCore.Qt.Key_Tab)
+        assert 0 <= win.spn_vc_seed.value() <= 2**31 - 1
+        win.spn_vc_seed.setValue(-5)
+        assert win.spn_vc_seed.value() == 0
+        # Fixed / Random
+        win.spn_vc_seed.setValue(123)
+        win.spn_vc_temp.setValue(0.55)
+        win.cmb_vc_seed_mode.setCurrentText("Random")
+        assert not win.spn_vc_seed.isEnabled()
+        assert win.clone_args()["seed"] is None and win.clone_args()["temperature"] == 0.55
+        win.cmb_vc_seed_mode.setCurrentText("Fixed")
+        assert win.spn_vc_seed.isEnabled() and win.clone_args()["seed"] == 123
+        # no horizontal overflow at either size, with Advanced open in both modes
+        for size in ((1240, 780), (1024, 640)):
+            win.resize(*size)
+            _app.processEvents()
+            for ref in (False, True):
+                (win.btn_vc_src_ref if ref else win.btn_vc_src_saved).setChecked(True)
+                _app.processEvents()
+                assert win.stack.widget(1).horizontalScrollBar().maximum() == 0, (size, ref)
+        win.close()
+    print("PASS: Advanced info buttons are focusable, labelled and show tips by mouse and keyboard; numeric fields keep their behavior")
+
+
+def _test_clone_tab_order_in_both_source_modes():
+    with _Patched(), _Library() as lib:
+        lib.add("Ada")
+        win, _ = _clone_window(models=_FakeModels())
+        win.refresh_voice_lists()
+        _shown(win)
+        win.btn_vc_advanced.setChecked(False)
+        saved = _focus_cycle(win, limit=40)
+        assert all(not label.startswith("?") for label in saved), saved
+        assert saved[:2] == ["Clone Voice", "Saved voice"] or saved[:3][1] == "Saved voice", saved[:4]
+        order = [saved.index(x) for x in ("combo:", "Refresh", "Text to generate", "combo:english", "Generate audio", "Advanced settings") if x in saved]
+        assert order == sorted(order), saved
+        win.btn_vc_src_ref.setChecked(True)
+        win.btn_vc_advanced.setChecked(True)
+        _app.processEvents()
+        ref = _focus_cycle(win, limit=60)
+        assert all(not label.startswith("?") for label in ref), ref
+        for needed in ("Reference audio", "Transcript", "Generate audio", "About Seed", "About Temperature",
+                       "About Direction tags", "Seed value", "Temperature"):
+            assert needed in ref, (needed, ref)
+        assert ref.index("Generate audio") < ref.index("Advanced settings") < ref.index("About Direction tags")
+        pinned = ["About Description", "Voice description", "New voice name", "Save as voice", "Advanced settings"]
+        assert [ref.index(x) for x in pinned] == sorted(ref.index(x) for x in pinned), (pinned, ref)
+        assert ref.index("Generate audio") < ref.index("New voice name")
+        assert ref.index("About Seed") < ref.index("Seed value") < ref.index("About Temperature") < ref.index("Temperature")
+        # one tab stop for the source pair, and it is the selected segment
+        for ref in (False, True):
+            (win.btn_vc_src_ref if ref else win.btn_vc_src_saved).setChecked(True)
+            _app.processEvents()
+            win.nav_buttons[1].setFocus()
+            _tab()
+            expected = win.btn_vc_src_ref if ref else win.btn_vc_src_saved
+            assert _app.focusWidget() is expected, (ref, _focus_label(_app.focusWidget()))
+            assert win.edt_vc_ref.accessibleName() != expected.text(), "distinct names"
+        win.btn_vc_src_ref.setChecked(True)
+        win.edt_vc_new_name.setText("Zed")
+        win.row_vc_use.setVisible(True)
+        win._vc_saved_name = "Ada"
+        win.btn_vc_use_saved.setFocus()
+        win.btn_vc_use_saved.click()
+        assert win.clone_source_kind() == "saved" and _app.focusWidget() is win.cmb_vc_voice, \
+            _focus_label(_app.focusWidget())
+        win.close()
+    print("PASS: Clone Voice tab order is logical in Saved voice mode and in Reference audio mode with Advanced open")
+
+
+
 def run_ui_tests():
     print("Running UI smoke tests (offscreen)...")
     _test_window_builds_with_sidebar_navigation()
@@ -2513,6 +3602,22 @@ def run_ui_tests():
     _test_footer_status_is_contextual_and_never_duplicates_errors()
     _test_footer_fits_and_is_keyboard_reachable_at_minimum_width()
     _test_create_voice_layout_at_minimum_and_wide_sizes()
+    _test_clone_sources_are_exclusive_and_only_the_active_one_is_sent()
+    _test_clone_validation_runs_before_any_model_loads()
+    _test_save_clone_never_overwrites_silently()
+    _test_save_clone_does_not_ask_while_a_task_is_running()
+    _test_clone_voice_list_refresh_keeps_selection_language_and_has_no_blank_mode()
+    _test_save_clone_offers_to_use_the_voice_without_switching()
+    _test_failed_replace_keeps_the_existing_voice_and_says_so()
+    _test_numeric_fields_share_one_style_and_keep_their_behavior()
+    _test_clone_save_records_the_real_seed_transcript_and_description()
+    _test_import_voice_from_audio_stores_an_empty_transcript_and_no_invented_seed()
+    _test_clone_preview_states_transitions_and_player()
+    _test_create_and_clone_players_share_the_audio_session_without_crosstalk()
+    _test_transcript_editor_prefill_handles_missing_empty_and_real_ref_text()
+    _test_clone_layout_keyboard_and_disclosure()
+    _test_clone_advanced_info_buttons_and_numeric_fields()
+    _test_clone_tab_order_in_both_source_modes()
     _test_busy_toggles_action_buttons()
     _test_single_primary_button_and_neutral_nav()
     _test_sidebar_and_control_sizes()
