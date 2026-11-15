@@ -37,3 +37,28 @@ Facts about the voice library and Clone Voice that are true today and not yet fi
 - The finished file is written and read back on the interface thread. Measured on macOS: a 60 minute mono 24 kHz
   file takes about 0.4 s to write (existing behaviour) and about 0.2 s to read back.
 - Screen reader behaviour (VoiceOver and others) is not verified.
+
+## Reference audio formats and dependencies
+
+Checked by hand on macOS (librosa 1.0.1, libsndfile 1.2.2), not by the test suites unless stated.
+
+- The model reads reference audio through `librosa`, which here decodes with `soundfile` (libsndfile) only. WAV,
+  FLAC, MP3 and OGG loaded through both `librosa.load` and `load_wav`. M4A did not: this librosa version has no
+  `audioread` fallback.
+- The file pickers offer only formats the installed libsndfile reports, so **M4A is never offered**, even where an
+  older librosa with `audioread` could decode it. Choosing an unreadable file explains the problem before any model
+  loads (the header check is covered by the test suites).
+- MP3 and OGG are offered only when the installed libsndfile reports them. Behaviour on Windows and Linux, and with
+  other libsndfile versions, is not verified.
+- `load_wav` (shared) reads 8/16/32-bit PCM WAV with the standard library as before and falls back to `soundfile`
+  for float or 24-bit WAV, FLAC and MP3 (covered by the test suites). That also applies to Import voice from audio
+  and the F5 reference. Clone's Save as voice still requires a `.wav` file.
+- `soundfile` reaches the app only through `qwen_tts`. From reading the code (not exercised), the app falls back to
+  offering WAV only without it. The tests import it directly.
+- From reading the code (not exercised): a float WAV with values above full scale is clipped in the saved
+  `reference.wav`, while the prompt is built from the unclipped array.
+
+## Real model
+
+- Clone Voice has not been run with the real Base model on this machine. All evidence so far comes from a stand-in
+  model.
