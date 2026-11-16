@@ -23,6 +23,7 @@ from PySide6.QtTest import QTest
 import audio_player
 from audio_utils import load_wav, write_wav
 import qt_app
+import qt_audiobook
 import icons
 import theme
 import voice_library
@@ -1690,6 +1691,401 @@ def _test_import_voice_orange_outline_is_the_keyboard_focus_ring():
     print("PASS: Import voice's orange outline is the focus ring (neutral otherwise); the empty-state text is short")
 
 
+class _AbVoices:
+    """A throwaway voices folder with a few voices, so the Audiobooks pickers have real choices."""
+
+    def __init__(self, *names):
+        self.names = names or ("Ana", "Marcus")
+
+    def __enter__(self):
+        self.original = voice_library.VOICES_DIR
+        voice_library.VOICES_DIR = tempfile.mkdtemp()
+        for name in self.names:
+            path = voice_library.voice_dir(name)
+            os.makedirs(path)
+            with open(os.path.join(path, "voice.json"), "w") as f:
+                json.dump({"name": name, "description": "d", "language": "english", "seed": 1, "created": "x"}, f)
+        return self
+
+    def __exit__(self, *exc):
+        voice_library.VOICES_DIR = self.original
+
+
+def _ab_segments(n):
+    import audiobook
+    return [audiobook.new_segment(f"Segment number {i + 1}.", "voice:Ana" if i % 2 == 0 else "voice:Marcus",
+                                  "narration" if i % 2 == 0 else "dialogue", "sad" if i == 2 else "") for i in range(n)]
+
+
+def _ab_tab(n=5):
+    win, _ = _make_window()
+    win.show_page(3)
+    win.resize(1024, 640)
+    win.show()
+    tab = win.audiobook_tab
+    tab.segments = _ab_segments(n)
+    tab.rebuild(select=0)
+    _app.processEvents()
+    return win, tab
+
+
+def _select_rows(tab, *rows):
+    tab.listw.clearSelection()
+    for r in rows:
+        tab.listw.item(r).setSelected(True)
+    tab.listw.setCurrentRow(rows[0], QtCore.QItemSelectionModel.NoUpdate)
+    _app.processEvents()
+
+
+def _test_audiobook_list_refills_and_selection_never_change_segments():
+    import copy
+    with _AbVoices():
+        win, tab = _ab_tab(6)
+        before = copy.deepcopy(tab.segments)
+        tab.refresh_voices()
+        tab.on_selection()
+        for r in (3, 1, 5, 0):
+            tab.listw.setCurrentRow(r)
+        _select_rows(tab, 1, 2, 4)
+        tab.rebuild(select=2)
+        assert tab.segments == before, "refilling combos or changing the selection must never write to the segments"
+        # a voice that disappeared stays visible and unchanged
+        tab.segments[2]["voice"] = "voice:Gone"
+        tab.rebuild(select=2)
+        assert tab.cmb_seg_voice.currentText() == "Missing: voice:Gone" and tab.segments[2]["voice"] == "voice:Gone"
+        tab.refresh_voices()
+        assert tab.segments[2]["voice"] == "voice:Gone"
+        win.close()
+    print("PASS: Audiobooks list: refills, selection changes and rebuilds never write to the segments; missing voices stay visible")
+
+
+def _test_audiobook_editor_applies_voice_to_the_selection_and_keeps_direction_per_segment():
+    with _AbVoices():
+        win, tab = _ab_tab(6)
+        # one segment: its text, voice and direction are shown; direction edits stay on that segment
+        tab.listw.setCurrentRow(2)
+        assert tab.txt_segment.toPlainText() == "Segment number 3." and tab.cmb_seg_direction.currentText() == "sad"
+        assert tab.cmb_seg_direction.isEnabled() and tab.lbl_seg_title.text() == "Segment 3 · Narration"
+        edit = tab.cmb_seg_direction.lineEdit()
+        edit.setFocus()
+        edit.selectAll()
+        for text in ("s", "whisper"):                   # real keys: auto-completion must not desync the box and the segment
+            edit.selectAll()
+            QTest.keyClicks(edit, text)
+            _app.processEvents()
+            assert tab.segments[2]["direction"] == tab.cmb_seg_direction.currentText() and tab.segments[2]["direction"].startswith(text)
+        edit.selectAll()
+        QTest.keyClicks(edit, "whisper")
+        tab.cmb_seg_direction.setEditText("whisper")
+        assert tab.segments[2]["direction"] == "whisper" and tab.segments[1]["direction"] == ""
+        assert "[whisper]" in tab.listw.item(2).data((QtCore.Qt.UserRole + 2))
+        # several segments: voice applies to all, text and direction are not editable, mixed shows no value
+        _select_rows(tab, 0, 1, 3)
+        assert tab.lbl_seg_title.text() == "3 segments selected"
+        assert not tab.txt_segment.isEnabled() and not tab.cmb_seg_direction.isEnabled()
+        assert tab.cmb_seg_voice.currentIndex() == -1, "mixed voices must not show (or write) a value"
+        assert tab.segments[0]["voice"] == "voice:Ana" and tab.segments[1]["voice"] == "voice:Marcus"
+        idx = tab.cmb_seg_voice.findData("voice:Marcus")
+        tab.cmb_seg_voice.setCurrentIndex(idx)          # what the user's pick does, then the activated signal
+        tab.cmb_seg_voice.activated.emit(idx)
+        assert [tab.segments[i]["voice"] for i in (0, 1, 3)] == ["voice:Marcus"] * 3
+        assert tab.segments[2]["voice"] == "voice:Ana" and tab.segments[2]["direction"] == "whisper", "unselected rows untouched"
+        assert "Marcus" in tab.listw.item(0).data(voice_list.NAME_ROLE)
+        assert tab.cmb_seg_voice.currentText().endswith("Marcus"), "all selected rows now agree, so the value shows"
+        # nothing selected: nothing can be written
+        tab.listw.clearSelection()
+        _app.processEvents()
+        assert not tab.cmb_seg_voice.isEnabled() and not tab.btn_delete.isEnabled() and not tab.btn_preview.isEnabled()
+        win.close()
+    print("PASS: Audiobooks editor: voice applies to every selected segment, direction and text stay per segment")
+
+
+def _test_audiobook_edits_split_merge_move_delete_and_project_round_trip_keep_voice_and_direction():
+    import audiobook
+    with _AbVoices(), _Patched():
+        win, tab = _ab_tab(4)
+        tab.segments[1]["direction"] = "angry"
+        tab.rebuild(select=1)
+        tab.txt_segment.setPlainText("Hello there friend.")
+        _app.processEvents()
+        assert tab.segments[1]["text"] == "Hello there friend."
+        tab.txt_segment.moveCursor(QtGui.QTextCursor.Start)
+        for _ in range(5):
+            tab.txt_segment.moveCursor(QtGui.QTextCursor.Right)
+        tab.btn_split_cursor.click()
+        assert len(tab.segments) == 5 and [s["text"] for s in tab.segments[1:3]] == ["Hello", "there friend."]
+        assert all(s["voice"] == "voice:Marcus" and s["direction"] == "angry" for s in tab.segments[1:3])
+        assert tab.selected_rows() == [2]
+        tab.listw.setCurrentRow(1)
+        tab.btn_merge.click()
+        assert len(tab.segments) == 4 and tab.segments[1]["text"] == "Hello there friend." and tab.segments[1]["direction"] == "angry"
+        tab.btn_down.click()
+        assert tab.segments[2]["text"] == "Hello there friend." and tab.selected_rows() == [2]
+        tab.btn_up.click()
+        assert tab.segments[1]["text"] == "Hello there friend."
+        tab.btn_add.click()
+        assert len(tab.segments) == 5 and tab.segments[2]["text"] == "New segment." and tab.selected_rows() == [2]
+        _select_rows(tab, 2, 3)
+        tab.btn_delete.click()
+        assert len(tab.segments) == 3 and tab.selected_rows() == [2]
+        # save and load keep everything, through the real project functions and the tab's own handlers
+        path = os.path.join(tempfile.mkdtemp(), "book.json")
+        original = QtWidgets.QFileDialog.getSaveFileName, QtWidgets.QFileDialog.getOpenFileName
+        QtWidgets.QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (path, ""))
+        QtWidgets.QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (path, ""))
+        try:
+            saved = [dict(s) for s in tab.segments]
+            tab.btn_save.click()
+            tab.segments = []
+            tab.rebuild()
+            assert tab.listw.count() == 0 and not tab.btn_delete.isEnabled()
+            tab.btn_load.click()
+        finally:
+            QtWidgets.QFileDialog.getSaveFileName, QtWidgets.QFileDialog.getOpenFileName = original
+        assert tab.segments == saved and tab.listw.count() == 3 and tab.selected_rows() == [0]
+        assert json.load(open(path))["schema"] == 1, "the project schema is unchanged"
+        win.close()
+    print("PASS: Audiobooks: split, merge, move, add, delete and project save/load keep voices and directions")
+
+
+def _test_audiobook_typing_keeps_selection_caret_and_focus():
+    with _AbVoices():
+        win, tab = _ab_tab(5)
+        tab.listw.setCurrentRow(3)
+        tab.txt_segment.setFocus()
+        _app.processEvents()
+        tab.txt_segment.moveCursor(QtGui.QTextCursor.End)
+        QTest.keyClicks(tab.txt_segment, " More words")
+        assert tab.selected_rows() == [3] and tab.txt_segment.hasFocus()
+        assert tab.txt_segment.textCursor().position() == len("Segment number 4. More words")
+        assert tab.segments[3]["text"] == "Segment number 4. More words"
+        assert "More words" in tab.listw.item(3).data((QtCore.Qt.UserRole + 2))
+        # a button that becomes unavailable never keeps focus
+        tab.listw.setCurrentRow(3)
+        tab.btn_merge.setFocus()
+        tab.listw.setCurrentRow(4)         # the last segment: nothing to merge with
+        _app.processEvents()
+        assert not tab.btn_merge.isEnabled() and not tab.btn_merge.hasFocus() and tab.listw.hasFocus()
+        win.close()
+    print("PASS: Audiobooks: typing keeps the selection, caret and focus; a control that goes away hands focus to the list")
+
+
+def _test_audiobook_rows_are_compact_readable_and_accessible():
+    long_name = "A Very Long Voice Name For The Narrator Of Chapter Twelve"
+    with _AbVoices("Ana", "Marcus", long_name):
+        win, tab = _ab_tab(27)
+        win.resize(1024, 640)
+        _app.processEvents()
+        tab.segments[0]["voice"] = f"voice:{long_name}"
+        tab.segments[2]["direction"] = "whisper"
+        tab.rebuild(select=2)
+        _app.processEvents()
+        # density: one line per segment, at the same type size as the rest of the app
+        row = tab.listw.sizeHintForRow(0)
+        assert row <= 32, row
+        rows_visible = tab.listw.viewport().height() / row
+        assert rows_visible >= 5.5, f"only {rows_visible:.1f} rows visible at 1024x640"   # offscreen fonts run taller; native shows 6.5+
+        delegate = tab.listw.itemDelegate()
+        assert isinstance(delegate, qt_audiobook.SegmentRowDelegate)
+        # long voice names are shortened in the row, never widen the list
+        scroll = tab.findChild(QtWidgets.QScrollArea)
+        assert scroll.horizontalScrollBar().maximum() == 0 and tab.listw.horizontalScrollBar().maximum() == 0
+        assert tab.listw.item(0).data(voice_list.NAME_ROLE) == long_name   # the full name, elided only when painted
+        # the row paints (selected, focused, hovered) without error and shows its content
+        for state in (QtWidgets.QStyle.State_Selected, QtWidgets.QStyle.State_HasFocus, QtWidgets.QStyle.State_MouseOver):
+            pix = QtGui.QPixmap(400, row)
+            pix.fill(QtGui.QColor("#000000"))
+            painter = QtGui.QPainter(pix)
+            option = QtWidgets.QStyleOptionViewItem()
+            option.rect = QtCore.QRect(0, 0, 400, row)
+            option.state = state
+            option.font = tab.listw.font()
+            delegate.paint(painter, option, tab.listw.model().index(2, 0))
+            painter.end()
+            image = pix.toImage()
+            assert any(image.pixelColor(x, y) != QtGui.QColor("#000000") for x in range(0, 400, 7) for y in range(0, row, 5))
+            edge = image.pixelColor(1, row // 2).name().lower()
+            if state == QtWidgets.QStyle.State_Selected:
+                assert edge == theme.COLORS["accent"].lower(), ("selected rows carry the accent bar", edge)
+            elif state == QtWidgets.QStyle.State_MouseOver:
+                assert edge != theme.COLORS["accent"].lower(), "hover alone never looks selected"
+            # State_HasFocus draws the accent focus frame by design
+        # the accessible text reads number, role, voice, direction and text
+        text = tab.listw.item(2).data(QtCore.Qt.AccessibleTextRole)
+        assert text.startswith("Segment 3, narration, voice Qwen: ") and "direction whisper" in text and "Segment number 3." in text, text
+        assert "[whisper]" in tab.listw.item(2).data(qt_audiobook.DESC_ROLE)
+        assert tab.listw.item(1).data(qt_audiobook.ROLE_ROLE) == "D" and tab.listw.item(0).data(qt_audiobook.ROLE_ROLE) == "N"
+        tab.segments[4]["voice"] = "voice:Gone"
+        tab.rebuild(select=4)
+        assert tab.listw.item(4).data(voice_list.NAME_ROLE) == "Missing: voice:Gone", "a missing voice keeps its full label"
+        tip = tab.listw.item(0).toolTip()
+        assert long_name in tip and tip.startswith("Segment 1 · Narration · Qwen: A Very Long"), tip
+        # multi-selection, keyboard navigation and Select All still work on the compact rows
+        tab.listw.setCurrentRow(2)
+        tab.listw.setFocus()
+        QTest.keyClick(tab.listw, QtCore.Qt.Key_Down)
+        assert tab.selected_rows() == [3]
+        QTest.keyClick(tab.listw, QtCore.Qt.Key_Down, QtCore.Qt.ShiftModifier)
+        assert tab.selected_rows() == [3, 4]
+        QTest.keyClick(tab.listw, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier)
+        assert len(tab.selected_rows()) == 27 and tab.lbl_seg_title.text() == "27 segments selected"
+        win.close()
+    print("PASS: Audiobooks rows: one compact line (5.5+ rows visible offscreen at 1024x640, 6.6 native), long names never widen the list, accessible text, selection and keys intact")
+
+
+def _test_audiobooks_page_opens_without_a_focused_button():
+    with _AbVoices():
+        win, _ = _make_window()
+        win.show()
+        win.activateWindow()
+        _app.processEvents()
+        win.txt_vd_instruct.setFocus()
+        _app.processEvents()
+        win.show_page(3)
+        _app.processEvents()
+        assert not isinstance(_app.focusWidget(), QtWidgets.QPushButton), "Return must not open a file dialog on arrival"
+        win.close()
+    print("PASS: Audiobooks opens with no button focused, like the other pages")
+
+
+def _test_audiobook_render_and_preview_run_through_the_new_page():
+    import audiobook
+    import qt_audiobook
+    from unittest.mock import patch
+    with _AbVoices(), _Patched() as patched:
+        win, tab = _ab_tab(3)
+        calls = []
+
+        def fake_render(gen, segment, settings, cache_dir=None):
+            calls.append(segment["text"])
+            return np.full(2400, 0.1, dtype=np.float32), 24000
+        original_dir = qt_audiobook.OUTPUT_DIR
+        qt_audiobook.OUTPUT_DIR = patched.tmp
+        try:
+            with patch.object(audiobook, "render_segment", fake_render):
+                # Render chapter from the header
+                tab.btn_render.click()
+                _wait_idle(win)
+                assert win.lbl_status.text().startswith("Chapter rendered (3 segments"), win.lbl_status.text()
+                assert win.last_output and os.path.isfile(win.last_output) and win.btn_play_last.isEnabled()
+                assert len(calls) == 3
+                # Preview segment plays the preview file
+                tab.listw.setCurrentRow(1)
+                assert tab.btn_preview.isEnabled()
+                tab.btn_preview.click()
+                _wait_idle(win)
+                assert patched.played and patched.played[-1].endswith("_segment_preview.wav"), patched.played
+                assert os.path.isfile(patched.played[-1])
+                # while a task runs nothing can start another; afterwards Preview follows the selection again
+                win.set_busy(True)
+                assert not tab.btn_render.isEnabled() and not tab.btn_preview.isEnabled()
+                win.set_busy(False)
+                assert tab.btn_render.isEnabled() and tab.btn_preview.isEnabled()
+                _select_rows(tab, 0, 1, 2)
+                win.set_busy(True)
+                win.set_busy(False)
+                assert not tab.btn_preview.isEnabled(), "Preview needs exactly one segment"
+        finally:
+            qt_audiobook.OUTPUT_DIR = original_dir
+        win.close()
+    print("PASS: Audiobooks: Render chapter and Preview segment work from the new page, and Preview follows the selection after a task")
+
+
+def _test_audiobook_tab_cycle_from_the_navigation_is_pinned_both_ways():
+    with _AbVoices():
+        win, tab = _ab_tab(5)
+        tab.listw.setCurrentRow(2)
+        win.show_page(3)
+        _shown(win)
+        fixed = lambda labels: ["Segments" if l == "?VoiceList" else l for l in labels]
+        forward = fixed(_focus_cycle(win))
+        expected = ["Audiobooks", "Open output folder",      # the footer follows the navigation here, as on every page not yet given an explicit order
+                    "Save project…", "Load project…", "Render chapter", "Chapter script", "combo:Qwen: Ana",
+                    "combo:Qwen: Marcus", "combo:english", "Split into segments", "Render settings", "Segments",
+                    "▶ Preview segment", "Selected segment text", "combo:Qwen: Ana", "combo:sad", "Split here",
+                    "Merge next", "Add after", "Move up", "Move down", "Delete"]
+        assert forward == expected, forward
+        backward = fixed(_focus_cycle(win, backwards=True))
+        assert backward == [expected[0]] + expected[:0:-1], backward
+        win.close()
+    print("PASS: Audiobooks: the whole Tab cycle from the navigation is pinned, forwards and backwards")
+
+
+def _test_audiobook_keyboard_wheel_and_geometry_at_the_minimum_window():
+    import audiobook
+    long_name = "A Very Long Voice Name For The Narrator Of Chapter Twelve"
+    with _AbVoices("Ana", "Marcus", long_name):
+        counts = []
+        for n in (2, 27):
+            win, tab = _ab_tab(n)
+            tab.cmb_narrator.setCurrentIndex(tab.cmb_narrator.findData(f"voice:{long_name}"))
+            tab.segments[0]["voice"] = f"voice:{long_name}"
+            tab.rebuild(select=0)
+            tab.btn_render.setFocus()
+            _app.processEvents()
+            stops = 0
+            while _app.focusWidget() is not tab.btn_preview and stops < 60:
+                QTest.keyClick(_app.focusWidget(), QtCore.Qt.Key_Tab)
+                _app.processEvents()
+                stops += 1
+            counts.append(stops)
+            assert stops < 30, f"{stops} Tab presses from Render to the last editor control"
+            if n == 27:
+                tab.listw.setCurrentRow(5)
+                tab.btn_save.setFocus()
+                _app.processEvents()
+                seen = []
+                for _ in range(19):
+                    QTest.keyClick(_app.focusWidget(), QtCore.Qt.Key_Tab)
+                    _app.processEvents()
+                    w = _app.focusWidget()
+                    seen.append(tab.cmb_seg_direction if w is tab.cmb_seg_direction.lineEdit() else w)
+                expected = [tab.btn_load, tab.btn_render, tab.txt_source, tab.cmb_narrator, tab.cmb_dialogue, tab.cmb_lang,
+                            tab.btn_split, tab.btn_settings, tab.listw, tab.btn_preview, tab.txt_segment, tab.cmb_seg_voice,
+                            tab.cmb_seg_direction, tab.btn_split_cursor, tab.btn_merge, tab.btn_add, tab.btn_up, tab.btn_down,
+                            tab.btn_delete]
+                assert seen == expected, [(w.accessibleName() or w.text()) for w in seen]
+            # geometry: nothing is clipped at 1024x640, Render is in view, no scrollbars
+            scroll = tab.findChild(QtWidgets.QScrollArea)
+            assert scroll.horizontalScrollBar().maximum() == 0 and scroll.verticalScrollBar().maximum() == 0
+            area = tab.rect()
+            for w in (tab.btn_save, tab.btn_load, tab.btn_render, tab.btn_split, tab.cmb_narrator, tab.cmb_dialogue,
+                      tab.cmb_lang, tab.listw, tab.txt_segment, tab.cmb_seg_voice, tab.cmb_seg_direction,
+                      tab.btn_delete, tab.btn_preview):
+                top_left = w.mapTo(tab, QtCore.QPoint(0, 0))
+                box = QtCore.QRect(top_left, w.size())
+                assert area.contains(box), (w.accessibleName() or w.text(), box, area)
+                assert w.width() >= w.minimumSizeHint().width(), (w.accessibleName() or w.text(), w.width())
+            assert tab.btn_render.isVisible()
+            # the wheel changes nothing unless the combo has focus
+            tab.listw.setCurrentRow(1)
+            tab.btn_render.setFocus()
+            before = tab.segments[1]["voice"]
+            ev = QtGui.QWheelEvent(QtCore.QPointF(5, 5), tab.cmb_seg_voice.mapToGlobal(QtCore.QPointF(5, 5)), QtCore.QPoint(0, 0),
+                                   QtCore.QPoint(0, -120), QtCore.Qt.NoButton, QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False)
+            index = tab.cmb_seg_voice.currentIndex()
+            _app.sendEvent(tab.cmb_seg_voice, ev)
+            tab.cmb_seg_voice.setFocus()
+            _app.processEvents()
+            _app.sendEvent(tab.cmb_seg_voice, ev)
+            _app.processEvents()
+            assert tab.cmb_seg_voice.currentIndex() == index and tab.segments[1]["voice"] == before, "the wheel never changes a voice"
+            tab.btn_settings.setChecked(True)
+            _app.processEvents()
+            for w, value in ((tab.spn_pause, tab.spn_pause.value()), (tab.spn_seed, tab.spn_seed.value()),
+                             (tab.spn_temp, tab.spn_temp.value()), (tab.cmb_seed_mode, tab.cmb_seed_mode.currentIndex())):
+                ev2 = QtGui.QWheelEvent(QtCore.QPointF(5, 5), w.mapToGlobal(QtCore.QPointF(5, 5)), QtCore.QPoint(0, 0),
+                                        QtCore.QPoint(0, 120), QtCore.Qt.NoButton, QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False)
+                _app.sendEvent(w, ev2)
+                _app.processEvents()
+                now = w.currentIndex() if isinstance(w, QtWidgets.QComboBox) else w.value()
+                assert now == value, f"the wheel changed {w.accessibleName()}"
+            tab.btn_settings.setChecked(False)
+            win.close()
+        assert counts[0] == counts[1], f"Tab stops must not grow with the number of segments: {counts}"
+    print("PASS: Audiobooks: Tab reaches the editor in a few stops at any size of book, nothing clips at 1024x640, the wheel never changes a voice")
+
+
 def _test_multiline_editors_never_trap_the_keyboard():
     win, _ = _make_window()
     win.resize(1024, 640)
@@ -2383,9 +2779,11 @@ def _test_busy_toggles_action_buttons():
 def _test_single_primary_button_and_neutral_nav():
     win, _ = _make_window()
     primaries = [b for b in win.findChildren(QtWidgets.QPushButton) if b.property("role") == "primary"]
-    assert set(primaries) == {win.btn_vd_generate, win.btn_vc_generate}, primaries
+    render = win.audiobook_tab.btn_render     # Audiobooks' one action: Render chapter
+    assert set(primaries) == {win.btn_vd_generate, win.btn_vc_generate, render}, primaries
     assert win.stack.widget(0).isAncestorOf(win.btn_vd_generate)
     assert win.stack.widget(1).isAncestorOf(win.btn_vc_generate)
+    assert win.stack.widget(3).isAncestorOf(render)
     assert all(b.property("role") == "nav" for b in win.nav_buttons)
     qss = theme.build_qss()
     selected = re.search(r'QPushButton\[role="nav"\]:checked \{(.*?)\}', qss, re.S).group(1)
@@ -3727,6 +4125,15 @@ def run_ui_tests():
     _test_my_voices_rows_are_exposed_to_accessibility()
     _test_my_voices_tab_stops_under_the_macos_default_tab_behavior()
     _test_multiline_editors_never_trap_the_keyboard()
+    _test_audiobook_list_refills_and_selection_never_change_segments()
+    _test_audiobook_editor_applies_voice_to_the_selection_and_keeps_direction_per_segment()
+    _test_audiobook_edits_split_merge_move_delete_and_project_round_trip_keep_voice_and_direction()
+    _test_audiobook_typing_keeps_selection_caret_and_focus()
+    _test_audiobook_keyboard_wheel_and_geometry_at_the_minimum_window()
+    _test_audiobook_rows_are_compact_readable_and_accessible()
+    _test_audiobooks_page_opens_without_a_focused_button()
+    _test_audiobook_render_and_preview_run_through_the_new_page()
+    _test_audiobook_tab_cycle_from_the_navigation_is_pinned_both_ways()
     _test_tab_leaves_description_under_the_macos_default_tab_behavior()
     _test_stale_sample_callout_and_footer_status()
     _test_icon_assets_are_vendored_licensed_and_only_the_used_ones()
