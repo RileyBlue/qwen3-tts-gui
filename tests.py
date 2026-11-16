@@ -330,6 +330,163 @@ def _test_audiobook_compile():
     print("PASS: audiobook compile")
 
 
+def _test_audiobook_cache_marker_legacy_entries_and_interrupted_writes():
+    """A cache entry counts only with its completion marker. Older entries (no marker) are unverified: regenerated
+    when needed, never deleted, and kept until a complete replacement exists. Writes are all-or-nothing."""
+    import shutil
+    import audiobook
+    from unittest.mock import patch
+
+    calls = []
+
+    class Gen:
+        def clone(self, **kw):
+            calls.append(1)
+            return [np.full(10, 0.5, dtype=np.float32)], 24000
+    settings = dict(language="english", min_words=0, max_words=0, seed=1, temperature=0.7)
+    seg = audiobook.new_segment("Cache me.", "voice:X")
+    cache = tempfile.mkdtemp()
+    try:
+        path = os.path.join(cache, audiobook.segment_cache_key(seg, settings) + ".npz")
+
+        def entries():
+            return sorted(os.listdir(cache))
+        # a fresh render writes a marked entry through a temporary file that does not remain
+        wav, _ = audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert entries() == [os.path.basename(path)] and len(calls) == 1
+        with np.load(path) as data:
+            assert bool(data["complete"]) and data["wav"].shape == (10,) and int(data["sr"]) == 24000
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert len(calls) == 1, "a marked entry is reused"
+        # legacy entry (written before the marker, possibly truncated): not trusted, not deleted
+        np.savez(path, wav=np.zeros(3, dtype=np.float32), sr=24000)
+        legacy = open(path, "rb").read()
+        # ... and while its replacement cannot be completed, it is still on disk, byte for byte
+        for target, name, error in ((audiobook.os, "replace", OSError("disk full")),
+                                    (audiobook.np, "savez", OSError("write failed"))):
+            n = len(calls)
+            with patch.object(target, name, side_effect=error):
+                try:
+                    audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+                except OSError:
+                    pass   # a failed cache write fails the render, as it always did
+                else:
+                    raise AssertionError("a cache write failure must not be swallowed")
+            assert len(calls) == n + 1, "the legacy entry must not be served"
+            assert open(path, "rb").read() == legacy, "legacy data stays until a complete replacement exists"
+            assert entries() == [os.path.basename(path)], "no temporary file is left behind"
+        # once a replacement is written completely, it takes over and is reused
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        with np.load(path) as data:
+            assert bool(data["complete"]) and data["wav"].shape == (10,)
+        n = len(calls)
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert len(calls) == n
+        # unreadable, empty or explicitly incomplete entries are regenerated and replaced
+        for damage in (b"", b"not an npz file at all"):
+            open(path, "wb").write(damage)
+            n = len(calls)
+            audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+            assert len(calls) == n + 1
+            with np.load(path) as data:
+                assert bool(data["complete"])
+        # a real, marked archive cut in half (a copy interrupted elsewhere) is regenerated, never half-served
+        whole = open(path, "rb").read()
+        open(path, "wb").write(whole[:len(whole) // 2])
+        n = len(calls)
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert len(calls) == n + 1
+        with np.load(path) as data:
+            assert bool(data["complete"]) and data["wav"].shape == (10,)
+        np.savez(path, wav=np.zeros(3, dtype=np.float32), sr=24000, complete=np.False_)
+        n = len(calls)
+        audiobook.render_segment(Gen(), seg, settings, cache_dir=cache)
+        assert len(calls) == n + 1
+        # nothing is ever removed from the cache folder by rendering
+        stray = os.path.join(cache, "legacy_other_entry.npz")
+        np.savez(stray, wav=np.zeros(2, dtype=np.float32), sr=24000)
+        audiobook.render_segment(Gen(), dict(seg, text="Another."), settings, cache_dir=cache)
+        assert os.path.isfile(stray)
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+    print("PASS: cache entries need a completion marker; legacy entries are regenerated but kept until replaced; writes are all-or-nothing")
+
+
+def _test_audiobook_stop_never_caches_or_returns_a_partial_segment():
+    """Stop during a Qwen segment makes clone() return only the chunks done so far. That partial audio must neither
+    be cached as if complete, nor let a chapter report success. Real TTSGenerator.clone and audiobook functions;
+    only the model is a stand-in."""
+    import shutil
+    import audiobook
+    import voice_library
+    import tts_generator
+    from unittest.mock import patch
+
+    text = " ".join(f"Sentence number {i} is here." for i in range(12))
+    settings = dict(language="english", min_words=10, max_words=12, seed=1, temperature=0.7)
+
+    def make_generator(stop, stop_on_call=None):
+        calls = {"n": 0}
+
+        class Model:
+            def generate_voice_clone(self, **kw):
+                calls["n"] += 1
+                if stop_on_call is not None and calls["n"] == stop_on_call:
+                    stop["v"] = True   # the user presses Stop while this chunk renders
+                return [np.full(1000, 0.1, dtype=np.float32)], 24000
+
+        class Models:
+            def get(self, kind, notify=None):
+                return Model()
+        return tts_generator.TTSGenerator(Models(), notify=lambda m: None, should_stop=lambda: stop["v"])
+
+    with patch.object(voice_library, "load_voice", lambda name: ({"description": "", "seed": 1}, [object()], None)):
+        full_chunks = len(make_generator({"v": False})._jobs(text, 10, 12))
+        assert full_chunks > 2, full_chunks
+        cache = tempfile.mkdtemp()
+        try:
+            # 1. Stop in the middle of one segment: nothing is returned and nothing is cached
+            stop = {"v": False}
+            segment = audiobook.new_segment(text, "voice:X")
+            wav, _ = audiobook.render_segment(make_generator(stop, stop_on_call=1), segment, settings, cache_dir=cache)
+            assert wav is None, "a partially rendered segment must not be returned"
+            assert os.listdir(cache) == [], "a partially rendered segment must not be cached"
+            # 2. The next clean render is complete (it must not find a truncated copy)
+            wav, _ = audiobook.render_segment(make_generator({"v": False}), segment, settings, cache_dir=cache)
+            assert len(wav) == 1000 * full_chunks and len(os.listdir(cache)) == 1
+            # 3. A complete render without Stop is still cached and reused
+            calls_before = len(os.listdir(cache))
+            wav2, _ = audiobook.render_segment(make_generator({"v": False}), segment, settings, cache_dir=cache)
+            assert len(wav2) == len(wav) and len(os.listdir(cache)) == calls_before
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+        # 4. Stop during the LAST segment in render order: the chapter is stopped, not "rendered" with a truncated segment
+        cache = tempfile.mkdtemp()
+        try:
+            stop = {"v": False}
+            gen = make_generator(stop, stop_on_call=2)   # call 1 = the short segment, call 2 = first chunk of the long one
+            segments = [audiobook.new_segment("Short one.", "voice:X"), audiobook.new_segment(text, "voice:X")]
+            with patch.object(audiobook, "SEGMENT_CACHE_DIR", cache), \
+                    patch.object(audiobook.render_segment, "__defaults__", (cache,)):
+                results = audiobook.render_chapter(gen, segments, settings, should_stop=lambda: stop["v"],
+                                                   notify=lambda m: None)
+                assert results is None, "a chapter whose last segment was cut short must report a stop"
+                assert len(os.listdir(cache)) == 1, "only the finished segment is cached"
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+        # 5. Preview segment path: a generator with no stop flag at all behaves as before
+        class Plain:
+            def clone(self, **kw):
+                return [np.zeros(10, dtype=np.float32)], 24000
+        cache = tempfile.mkdtemp()
+        try:
+            wav, _ = audiobook.render_segment(Plain(), audiobook.new_segment("Hi.", "voice:X"), settings, cache_dir=cache)
+            assert wav is not None and len(os.listdir(cache)) == 1
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+    print("PASS: a stopped Qwen segment is never cached or returned, and a chapter stopped in its last segment reports a stop")
+
+
 def _test_audiobook_cache_and_grouping():
     import audiobook
     calls = []
@@ -1351,6 +1508,8 @@ def run_tests():
     _test_audiobook_split()
     _test_audiobook_compile()
     _test_audiobook_cache_and_grouping()
+    _test_audiobook_stop_never_caches_or_returns_a_partial_segment()
+    _test_audiobook_cache_marker_legacy_entries_and_interrupted_writes()
     _test_xtts_generation()
     _test_csm_generation()
     _test_dia_generation()
