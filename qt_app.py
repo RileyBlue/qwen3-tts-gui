@@ -22,23 +22,38 @@ import icons
 import task_errors
 import voice_library
 import voice_list
-from audio_utils import save_outputs, write_wav, load_wav
+from audio_utils import (save_outputs, write_wav, load_wav, load_voice_clone_prompt, audio_problem,
+                         audio_file_filter)
 from config import (
     DEFAULT_ATTN, DEFAULT_DEVICE, DEFAULT_DTYPE, DEFAULT_LANGUAGE, DEFAULT_MAX_WORDS,
     DEFAULT_MIN_WORDS, ATTNS, DTYPES, LANGUAGES, MODELS, MODEL_MAP, OUTPUT_DIR,
 )
 from model_loader import ModelManager
 from qt_audiobook import AudiobookTab
-from theme import COLORS, SIDEBAR_WIDTH, apply_theme, set_role
+from theme import COLORS, SIDEBAR_WIDTH, apply_theme, set_role, style_numeric
 from tts_generator import TTSGenerator
-from voice_lock import EMOTION_PRESETS
+from voice_lock import EMOTION_PRESETS, parse_emotion_segments
 
-DIRECTION_HELP = (
-    "Direct the performance like an actor: put a [tag] before a passage and it applies until the next "
-    "tag. Use a preset ([angry], [whisper], [sad]…) or any free-text style, e.g. "
-    "[shaky voice, holding back tears]. Emphasis is shaped by wording and punctuation (!, ?, …, "
-    "short sentences); Qwen3-TTS has no markup for stressing single words."
-)
+
+# Explanations behind the (i) buttons in Clone Voice > Advanced settings. Kept to what the backend does:
+# Seed is applied with seed_everything() before each chunk; Temperature is the sampling temperature
+# (talker and sub-talker); X-vector only and the prompt file follow qwen_tts' own descriptions.
+SETTING_LABEL_WIDTH = 120
+SEED_TIP = ("Fixed starts every chunk from the same random state, which makes results more repeatable "
+            "(it does not guarantee identical audio). Random picks a new one each time.")
+TEMPERATURE_TIP = ("How much the delivery varies. Lower is steadier and more conservative, higher is more "
+                   "varied. Range 0.1 to 1.5; the default here is 0.7.")
+DIRECTION_TAGS_TIP = ("Put a [tag] before a passage to change how it is delivered; it applies until the next tag. "
+                      "Use a preset such as [sad] or [whisper], or any short style like [shaky voice]. "
+                      "Tags need a voice description (a saved voice's own, or the Description field in Reference audio): the "
+                      "clone model takes no instructions, so each tag is performed from a short reference made with it.")
+DESCRIPTION_TIP = ("A short description of the voice, saved with it. It is used only for [tag] directions: each tag is "
+                   "performed from a short reference made with this description, so a saved voice without one can't "
+                   "use tags. Generating here from a recording or prompt file with tags uses the same description.")
+XVECTOR_TIP = ("Uses only the speaker embedding of the recording, so no transcript is needed. "
+               "Without it, the transcript must match the recording.")
+PROMPT_FILE_TIP = ("Reuses a clone prompt (.npz) saved earlier instead of the recording. "
+                   "Only open prompt files you trust.")
 
 # Optional starting points for the voice description. Selecting one appends its phrase;
 # deselecting (or editing it away) removes only that phrase, so typed text is never lost.
@@ -79,6 +94,7 @@ def shortcut_text(sequence=GENERATE_SHORTCUT):
 
 # Preview panel pages (Create Voice).
 PV_EMPTY, PV_BUSY, PV_READY, PV_ERROR = range(4)
+CV_EMPTY, CV_BUSY, CV_READY, CV_ERROR, CV_PARTIAL, CV_STOPPED, CV_SAVED = range(7)   # Clone Voice result surface states
 
 
 def cuda_available():
@@ -141,25 +157,10 @@ def seed_row(default_mode, default_value):
     value.setRange(0, 2**31 - 1)
     value.setValue(default_value)
     value.setEnabled(default_mode == "Fixed")
+    style_numeric(value, name="Seed value")
+    mode.setAccessibleName("Seed mode")
     mode.currentTextChanged.connect(lambda m: value.setEnabled(m == "Fixed"))
     return mode, value
-
-
-def tab_page(body_layout_builder):
-    """Return (page, body_layout, bar_layout): scrollable body + fixed action bar."""
-    page = QtWidgets.QWidget()
-    outer = QtWidgets.QVBoxLayout(page)
-    outer.setContentsMargins(24, 24, 24, 16)
-    scroll = QtWidgets.QScrollArea()
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-    body = QtWidgets.QWidget()
-    body_layout = QtWidgets.QVBoxLayout(body)
-    scroll.setWidget(body)
-    outer.addWidget(scroll, 1)
-    bar = QtWidgets.QHBoxLayout()
-    outer.addLayout(bar)
-    return page, body_layout, bar
 
 
 def page_header(title, subtitle=None):
@@ -182,6 +183,108 @@ def page_header(title, subtitle=None):
 def format_duration(seconds):
     seconds = int(round(seconds))
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+class InfoPopup(QtWidgets.QLabel):
+    """The explanation shown while an InfoButton has keyboard focus. A native tooltip can't be used
+    for this: Qt dismisses it on the very next key event, which is the Tab key's own release."""
+
+    _shared = None
+    owner = None
+
+    def __init__(self):
+        super().__init__(None, QtCore.Qt.ToolTip | QtCore.Qt.FramelessWindowHint)
+        self.setObjectName("infoPopup")
+        self.setWordWrap(True)
+        self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
+        self.setFixedWidth(300)
+        self.setTextFormat(QtCore.Qt.PlainText)
+
+    @classmethod
+    def show_for(cls, button, text):
+        if cls._shared is None:
+            cls._shared = cls()
+        pop = cls._shared
+        cls.owner = button
+        pop.setText(text)
+        pop.adjustSize()
+        pos = button.mapToGlobal(QtCore.QPoint(0, button.height() + 4))
+        screen = button.screen().availableGeometry() if button.screen() else None
+        if screen:   # keep it on screen
+            pos.setX(max(screen.left(), min(pos.x(), screen.right() - pop.width())))
+            if pos.y() + pop.height() > screen.bottom():
+                pos.setY(button.mapToGlobal(QtCore.QPoint(0, 0)).y() - pop.height() - 4)
+        pop.move(pos)
+        pop.show()
+
+    @classmethod
+    def hide_popup(cls):
+        cls.owner = None
+        if cls._shared is not None:
+            cls._shared.hide()
+
+    @classmethod
+    def is_open(cls):
+        return cls._shared is not None and cls._shared.isVisible()
+
+
+class InfoButton(QtWidgets.QPushButton):
+    """A small keyboard-focusable (i) beside a label. The explanation shows on hover (native tooltip) and
+    while it has keyboard focus (InfoPopup), is read by screen readers as the description, and Escape
+    dismisses it."""
+
+    def __init__(self, topic, text, parent=None):
+        super().__init__(parent)
+        self.topic, self.text_plain = topic, text
+        set_role(self, "info")
+        icons.apply(self, "info", 14)
+        self.setIconSize(QtCore.QSize(14, 14))
+        self.setFixedSize(22, 22)
+        self.setCursor(QtCore.Qt.WhatsThisCursor)
+        self.setAccessibleName(f"About {topic}")
+        self.setAccessibleDescription(text)
+        # rich text is what makes Qt wrap a tooltip instead of stretching it across the screen
+        self.setToolTip(f"<p style='white-space:normal; width:260px'>{text}</p>")
+
+    def event(self, event):
+        if event.type() == QtCore.QEvent.ToolTip:   # hover: one bubble style for mouse and keyboard
+            InfoPopup.show_for(self, self.text_plain)
+            return True
+        return super().event(event)
+
+    def mousePressEvent(self, event):
+        if InfoPopup.is_open() and InfoPopup.owner is self and not self.hasFocus():
+            InfoPopup.hide_popup()
+        else:
+            InfoPopup.show_for(self, self.text_plain)
+        super().mousePressEvent(event)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if not self.hasFocus():
+            InfoPopup.hide_popup()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        if event.reason() in (QtCore.Qt.TabFocusReason, QtCore.Qt.BacktabFocusReason, QtCore.Qt.ShortcutFocusReason):
+            InfoPopup.show_for(self, self.text_plain)
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        InfoPopup.hide_popup()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        InfoPopup.hide_popup()
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Escape and InfoPopup.is_open():
+            InfoPopup.hide_popup()
+            return
+        if event.key() in (QtCore.Qt.Key_Space, QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            InfoPopup.show_for(self, self.text_plain)   # activating it shows the explanation again
+            return
+        super().keyPressEvent(event)
 
 
 class WrapLabel(QtWidgets.QLabel):
@@ -294,6 +397,205 @@ class WaveformView(QtWidgets.QWidget):
             painter.drawRect(QtCore.QRectF(min(head, self.width() - 2), 0, 2, self.height()))
 
 
+class PreviewPlayer(QtWidgets.QWidget):
+    """Waveform, seek slider, position / length and Back - Play/Pause/Resume - Forward for ONE audio file, driven by
+    audio_player's single session. It knows nothing about voices, generation or which screen hosts it: the host
+    decides when audio exists (`set_audio` / `clear`) and listens to `changed` (refresh the footer) and `failed`.
+    Behaviour moved unchanged from the Create Voice Preview."""
+
+    changed = QtCore.Signal()    # after any play / pause / stop / seek the player itself caused
+    failed = QtCore.Signal(str)  # audio_player.play raised: the text for the host's own notice
+
+    def __init__(self, noun="sample"):
+        super().__init__()
+        self._noun = noun
+        self._path = None
+        self._duration = 0.0   # seconds, from the samples themselves
+        self._start = 0.0      # where Play starts when nothing is playing (set by seeking while stopped)
+        self._last = "stopped"
+        self._syncing = False
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+        self.wave = WaveformView()
+        self.wave.setAccessibleName(f"Waveform of the generated {noun}")
+        self.wave.seek_requested.connect(lambda fraction: self.seek(fraction * self._duration))
+        lay.addWidget(self.wave)
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider.setAccessibleName("Seek")
+        self.slider.setTracking(False)   # dragging only moves the handle; the seek happens on release
+        self.slider.setSingleStep(5000)
+        self.slider.setPageStep(10000)
+        self.slider.setEnabled(False)
+        self.slider.valueChanged.connect(self._on_slider)
+        self.slider.sliderMoved.connect(lambda ms: self._show_position(ms / 1000.0))
+        lay.addWidget(self.slider)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.lbl_pos = QtWidgets.QLabel("0:00")
+        self.lbl_pos.setAccessibleName("Position")
+        set_role(self.lbl_pos, "muted")
+        row.addWidget(self.lbl_pos)
+        row.addStretch(1)
+        self.btn_back = QtWidgets.QPushButton()
+        self.btn_back.setAccessibleName("Back 5 seconds")
+        self.btn_back.setToolTip("Back 5 seconds")
+        self.btn_back.clicked.connect(lambda: self.seek(self.position() - SEEK_STEP))
+        self.btn_play = QtWidgets.QPushButton("Play")
+        icons.apply(self.btn_play, "play")
+        self.btn_play.setToolTip(f"Play the generated {noun}")
+        self.btn_play.clicked.connect(self.toggle)
+        self.btn_forward = QtWidgets.QPushButton()
+        self.btn_forward.setAccessibleName("Forward 5 seconds")
+        self.btn_forward.setToolTip("Forward 5 seconds")
+        self.btn_forward.clicked.connect(lambda: self.seek(self.position() + SEEK_STEP))
+        for b, glyph in ((self.btn_back, "rotate-ccw"), (self.btn_forward, "rotate-cw")):
+            set_role(b, "quiet")
+            icons.apply(b, glyph)
+        row.addWidget(self.btn_back)
+        row.addWidget(self.btn_play)
+        row.addWidget(self.btn_forward)
+        row.addStretch(1)
+        self.lbl_len = QtWidgets.QLabel("0:00")
+        self.lbl_len.setAccessibleName("Length")
+        set_role(self.lbl_len, "muted")
+        row.addWidget(self.lbl_len)
+        lay.addLayout(row)
+
+    # ---- what the host controls
+    def set_audio(self, path, samples, sr):
+        """Show `path` (its `samples` at `sr` give the waveform and length). Playback starts only when asked."""
+        samples = np.asarray(samples)
+        self.wave.set_samples(samples)
+        self._duration = samples.reshape(-1).size / sr
+        self._path = path
+        self._start = 0.0
+        self._last = "stopped"
+        self.lbl_len.setText(format_duration(self._duration))
+        self.slider.setRange(0, int(self._duration * 1000))
+        self.refresh()
+
+    def clear(self):
+        """No audio. Stops this player's own playback; audio of another screen is left alone."""
+        if self.state() != "stopped":
+            audio_player.stop()
+        self._path, self._duration, self._start, self._last = None, 0.0, 0.0, "stopped"
+        self.wave.set_samples([])
+        self.wave.set_progress(None)
+        self.lbl_len.setText("0:00")
+        self.lbl_pos.setText("0:00")
+        self.slider.setRange(0, 0)
+        for w in (self.slider, self.btn_back, self.btn_forward):
+            w.setEnabled(False)
+        self._set_play_label("Play", "stopped", True)
+
+    def stop(self):
+        """Stop this player's own playback (another screen's audio is left alone); the audio stays loaded."""
+        if self.state() != "stopped":
+            audio_player.stop()
+            self.changed.emit()
+        self._start = 0.0
+        self.refresh()
+
+    def reset_start(self):
+        """Stopped from outside (footer Stop, new generation): the next Play begins at the start."""
+        self._start = 0.0
+
+    def has_audio(self):
+        return self._path is not None
+
+    def path(self):
+        return self._path
+
+    def duration(self):
+        return self._duration
+
+    def focus_chain(self):
+        return [self.slider, self.btn_back, self.btn_play, self.btn_forward]
+
+    # ---- state
+    def state(self):
+        """'playing' / 'paused' / 'stopped' for this player's own audio. Audio that belongs to another screen
+        (a voice reference, a render, another preview) counts as stopped here."""
+        if not self._path or audio_player.current_path() != self._path:
+            return "stopped"
+        return audio_player.state()
+
+    def position(self):
+        if self.state() == "stopped":
+            return self._start
+        return audio_player.position() or 0.0
+
+    # ---- actions
+    def toggle(self):
+        if not self._path:
+            return
+        state = self.state()
+        if state == "playing":
+            audio_player.pause() if audio_player.can_control() else audio_player.stop()
+        elif state == "paused":
+            audio_player.resume()
+        else:
+            start = self._start if 0 < self._start < self._duration - 0.1 else 0.0
+            try:
+                audio_player.play(self._path, start=start) if start > 0 else audio_player.play(self._path)
+            except Exception as e:
+                self.failed.emit(str(e))
+        self.changed.emit()
+        self.refresh()
+
+    def seek(self, seconds):
+        if not self._path or self._duration <= 0 or not audio_player.can_control():
+            return
+        seconds = min(max(0.0, seconds), max(0.0, self._duration - 0.05))
+        if self.state() == "stopped":
+            self._start = seconds
+        else:
+            audio_player.seek(seconds)
+        self.refresh()
+
+    def _on_slider(self, ms):
+        if not self._syncing:
+            self.seek(ms / 1000.0)
+
+    def _show_position(self, seconds):
+        self.lbl_pos.setText(format_duration(seconds))
+        self.slider.setAccessibleDescription(f"{format_duration(seconds)} of {format_duration(self._duration)}")
+
+    def _set_play_label(self, label, state, control):
+        if self.btn_play.text() != label:
+            self.btn_play.setText(label)
+            icons.apply(self.btn_play, ("pause" if control else "square") if label != "Play" else "play")
+            self.btn_play.setToolTip({"Pause": "Pause playback", "Stop": "Stop playback"}.get(
+                label, f"Resume the {self._noun}" if state == "paused" else f"Play the generated {self._noun}"))
+        if state == "paused":
+            self.btn_play.setToolTip("Resume playback")
+
+    def refresh(self):
+        """Mirror audio_player's real state into the controls. The host's timer calls it, and every action does."""
+        if not self._path:
+            return
+        state = self.state()
+        if state == "stopped" and self._last in ("playing", "paused"):
+            self._start = 0.0   # finished or stopped: the next Play starts from the beginning
+        self._last = state
+        control = audio_player.can_control()
+        playing = state == "playing"
+        self._set_play_label(("Pause" if control else "Stop") if playing else "Play", state, control)
+        for w in (self.slider, self.btn_back, self.btn_forward):
+            w.setEnabled(control)
+        position = min(self.position(), self._duration)
+        if not self.slider.isSliderDown():
+            self._syncing = True
+            self.slider.setValue(int(position * 1000))
+            self._syncing = False
+            self._show_position(position)
+        if not control:
+            self.lbl_pos.setText("–")
+        active = state != "stopped" or self._start > 0
+        self.wave.set_progress(position / self._duration if active and self._duration else None)
+
+
 class ActivityBar(QtWidgets.QWidget):
     """Restrained indeterminate indicator: one short segment gliding along a quiet track.
 
@@ -356,6 +658,7 @@ class DirectionBar(QtWidgets.QWidget):
         lay.addWidget(self.preset)
         btn = QtWidgets.QPushButton("Insert [tag] at cursor")
         btn.clicked.connect(self.insert)
+        self.btn_insert = btn
         lay.addWidget(btn)
         lay.addStretch(1)
 
@@ -366,6 +669,7 @@ class DirectionBar(QtWidgets.QWidget):
 
 class MainWindow(QtWidgets.QMainWindow):
     _failure_details = ""   # sanitized technical text of the last Create Voice failure
+    _clone_failure_details = ""   # the same for Clone Voice, so the two screens never show each other's details
     _gen_t0 = None          # time.monotonic() when the running generation started
     _gen_stage = STAGE_PREPARING
 
@@ -399,7 +703,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clone_page = self._build_clone_tab()
         voices_page = self._build_voices_tab()
         self.audiobook_tab = AudiobookTab(self, text_edit, combo, seed_row)
-        for dense in (clone_page, self.audiobook_tab):  # not redesigned yet: keep them compact
+        for dense in (self.audiobook_tab,):  # not redesigned yet: keep them compact
             dense.setProperty("density", "compact")
         self.stack.addWidget(clone_page)
         self.stack.addWidget(voices_page)
@@ -421,6 +725,10 @@ class MainWindow(QtWidgets.QMainWindow):
         main_col.addWidget(footer)
         shell.addLayout(main_col, 1)
         self.show_page(0)
+        try:
+            voice_library.recover_interrupted_saves()   # finish a replace that was cut short by a crash
+        except OSError:
+            pass
         self.refresh_voice_lists()
 
         screen = QtGui.QGuiApplication.primaryScreen().availableGeometry()
@@ -515,6 +823,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cmb_vd_lang, self.btn_vd_advanced,
             self.cmb_vd_seed_mode, self.spn_vd_seed, self.chk_vd_autosave, self.cmb_vd_name_gender,
             self.btn_vd_rand_name, self.btn_vd_open_settings,
+            # Clone Voice, in reading order (hidden pages are skipped by Qt)
+            self.btn_vc_src_saved, self.btn_vc_src_ref, self.cmb_vc_voice, self.btn_vc_refresh,
+            self.edt_vc_ref, self.btn_vc_ref_browse, self.txt_vc_ref_text, self.chk_vc_xvec,
+            self.txt_vc_text, self.cmb_vc_lang, self.btn_vc_generate, self.btn_vc_details, self.btn_vc_error_settings, *self.vc_player.focus_chain(),
+            self.info_buttons["Description"], self.txt_vc_instruct,
+            self.edt_vc_new_name, self.btn_vc_save_voice, self.btn_vc_use_saved, self.btn_vc_advanced,
+            self.info_buttons["Direction tags"], self.dir_vc.preset, self.dir_vc.btn_insert,
+            self.info_buttons["Seed"], self.cmb_vc_seed_mode, self.spn_vc_seed,
+            self.info_buttons["Temperature"], self.spn_vc_temp,
+            self.chk_vc_npz, self.edt_vc_reuse, self.btn_vc_reuse_browse,
+            self.edt_vc_save, self.btn_vc_save_browse,
             self.btn_play_last, self.btn_stop_audio, self.btn_open_out, self.btn_stop,
         ]
         for first, second in zip(chain, chain[1:]):
@@ -547,6 +866,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spn_max = QtWidgets.QSpinBox()
         self.spn_max.setRange(0, 5000)
         self.spn_max.setValue(int(DEFAULT_MAX_WORDS))
+        style_numeric(self.spn_min, name="Min words per chunk")
+        style_numeric(self.spn_max, name="Max words per chunk")
 
         def section(title, description, rows):
             head = QtWidgets.QLabel(title)
@@ -669,9 +990,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def stop_audio(self):
         audio_player.stop()
-        self._pv_start = 0.0
+        self.vd_player.reset_start()
+        self.vc_player.reset_start()
         self._refresh_audio_state()
         self._refresh_player()
+        self.vc_player.refresh()
 
     def open_output_folder(self):
         """Open the renders folder; recreate it if it was removed, and say so if the system can't open it."""
@@ -752,17 +1075,20 @@ class MainWindow(QtWidgets.QMainWindow):
         return os.path.join(OUTPUT_DIR, f"{prefix}_{stamp}_{uuid.uuid4().hex[:3]}.wav")
 
     def finish_long_form(self, prefix):
-        def on_done(result):
+        def on_done(result, early=None):
+            """early: True/False when the caller knows whether chunks were really skipped; None = the Stop flag."""
             wavs, sr = result
             if not wavs:
                 self.status("Stopped before any audio was produced.")
-                return
+                return None
             path = self.output_path(prefix)
             save_outputs(wavs, sr, path)
             self.last_output = path
             self.btn_play_last.setEnabled(True)
-            self.status(("Stopped early; partial audio saved to: " if self.task.stop_event.is_set()
-                         else "Done. Audio saved to: ") + path)
+            if early is None:
+                early = self.task.stop_event.is_set()
+            self.status(("Stopped early; partial audio saved to: " if early else "Done. Audio saved to: ") + path)
+            return path
         return on_done
 
     # ------------------------------------------------------------------ Voice Creator
@@ -991,49 +1317,15 @@ class MainWindow(QtWidgets.QMainWindow):
         text_row.addWidget(self.btn_vd_edit_text)
         rl.addLayout(text_row)
 
-        self.vd_wave = WaveformView()
-        self.vd_wave.seek_requested.connect(lambda fraction: self._seek_preview(fraction * self._pv_duration))
-        rl.addWidget(self.vd_wave)
-        self.sld_vd_seek = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.sld_vd_seek.setAccessibleName("Seek")
-        self.sld_vd_seek.setTracking(False)   # dragging only moves the handle; the seek happens on release
-        self.sld_vd_seek.setSingleStep(5000)
-        self.sld_vd_seek.setPageStep(10000)
-        self.sld_vd_seek.setEnabled(False)
-        self.sld_vd_seek.valueChanged.connect(self._on_seek_slider)
-        self.sld_vd_seek.sliderMoved.connect(lambda ms: self._show_position(ms / 1000.0))
-        rl.addWidget(self.sld_vd_seek)
-        player = QtWidgets.QHBoxLayout()
-        player.setSpacing(8)
-        self.lbl_vd_time = QtWidgets.QLabel("0:00")
-        self.lbl_vd_time.setAccessibleName("Position")
-        set_role(self.lbl_vd_time, "muted")
-        player.addWidget(self.lbl_vd_time)
-        player.addStretch(1)
-        self.btn_vd_back = QtWidgets.QPushButton()
-        self.btn_vd_back.setAccessibleName("Back 5 seconds")
-        self.btn_vd_back.setToolTip("Back 5 seconds")
-        self.btn_vd_back.clicked.connect(lambda: self._seek_preview(self._pv_position() - SEEK_STEP))
-        self.btn_vd_play = QtWidgets.QPushButton("Play")
-        icons.apply(self.btn_vd_play, "play")
-        self.btn_vd_play.setToolTip("Play the generated sample")
-        self.btn_vd_play.clicked.connect(self.play_sample)
-        self.btn_vd_forward = QtWidgets.QPushButton()
-        self.btn_vd_forward.setAccessibleName("Forward 5 seconds")
-        self.btn_vd_forward.setToolTip("Forward 5 seconds")
-        self.btn_vd_forward.clicked.connect(lambda: self._seek_preview(self._pv_position() + SEEK_STEP))
-        for b, glyph in ((self.btn_vd_back, "rotate-ccw"), (self.btn_vd_forward, "rotate-cw")):
-            set_role(b, "quiet")
-            icons.apply(b, glyph)
-        player.addWidget(self.btn_vd_back)
-        player.addWidget(self.btn_vd_play)
-        player.addWidget(self.btn_vd_forward)
-        player.addStretch(1)
-        self.lbl_vd_total = QtWidgets.QLabel("0:00")
-        self.lbl_vd_total.setAccessibleName("Length")
-        set_role(self.lbl_vd_total, "muted")
-        player.addWidget(self.lbl_vd_total)
-        rl.addLayout(player)
+        self.vd_player = PreviewPlayer("sample")
+        self.vd_player.changed.connect(self._refresh_audio_state)
+        self.vd_player.failed.connect(self._on_preview_play_failed)
+        rl.addWidget(self.vd_player)
+        # the names the rest of the window (and its tests) already use for these controls
+        self.vd_wave, self.sld_vd_seek = self.vd_player.wave, self.vd_player.slider
+        self.btn_vd_back, self.btn_vd_play, self.btn_vd_forward = (
+            self.vd_player.btn_back, self.vd_player.btn_play, self.vd_player.btn_forward)
+        self.lbl_vd_time, self.lbl_vd_total = self.vd_player.lbl_pos, self.vd_player.lbl_len
         self.lbl_vd_origin = WrapLabel("")  # which inputs produced this audio
         self.lbl_vd_origin.setAccessibleName("Sample made from")
         set_role(self.lbl_vd_origin, "muted")
@@ -1316,23 +1608,24 @@ class MainWindow(QtWidgets.QMainWindow):
         icons.apply(self.btn_vd_details, "chevron-down" if on else "chevron-right")
         self._relayout_preview()
 
-    def copy_failure_details(self):
-        QtWidgets.QApplication.clipboard().setText(self._failure_details)
+    def copy_failure_details(self, text=None):
+        QtWidgets.QApplication.clipboard().setText(self._failure_details if not isinstance(text, str) else text)
         self.status("Technical details copied.")
 
-    def _open_failure_dialog(self):
-        """Details for a failed regeneration, where the previous good sample stays on screen."""
+    def _open_failure_dialog(self, details=None):
+        """Technical details of a failure whose previous good result stays on screen. Defaults to Create Voice's."""
+        details = self._failure_details if details is None else details
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Technical details")
         dialog.setMinimumSize(560, 320)
         lay = QtWidgets.QVBoxLayout(dialog)
         box = text_edit(10, read_only=True)
         box.setAccessibleName("Technical details text")
-        box.setPlainText(self._failure_details)
+        box.setPlainText(details)
         lay.addWidget(box, 1)
         buttons = QtWidgets.QDialogButtonBox()
         copy = buttons.addButton("Copy details", QtWidgets.QDialogButtonBox.ActionRole)
-        copy.clicked.connect(self.copy_failure_details)
+        copy.clicked.connect(lambda: self.copy_failure_details(details))
         buttons.addButton(QtWidgets.QDialogButtonBox.Close)
         buttons.rejected.connect(dialog.reject)
         lay.addWidget(buttons)
@@ -1340,14 +1633,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_ready(self, result):
         wav, sr = np.asarray(result["wav"]), result["sr"]
-        self.vd_wave.set_samples(wav)
-        self._pv_duration = wav.reshape(-1).size / sr
-        self._pv_start = 0.0
-        self._pv_last = "stopped"
+        self.vd_player.set_audio(result["preview"], wav, sr)
         self.txt_vd_spoken.setPlainText(result.get("text") or voice_library.SAMPLE_TEXT)
-        self.lbl_vd_total.setText(format_duration(self._pv_duration))
-        self.sld_vd_seek.setRange(0, int(self._pv_duration * 1000))
-        self._refresh_player()
         self.lbl_vd_origin.setText(self._origin_text(result))
         self.lbl_vd_origin.setToolTip(result["description"])
         # Always reachable (tooltip, screen-reader description); shown inline only when it matters (stale).
@@ -1497,7 +1784,7 @@ class MainWindow(QtWidgets.QMainWindow):
         seed = (self.spn_vd_seed.value() if self.cmb_vd_seed_mode.currentText() == "Fixed"
                 else random.randint(0, 2**31 - 1))
         audio_player.stop()
-        self._pv_start = 0.0
+        self.vd_player.reset_start()
 
         def work(task):
             # The same call design_sample makes: it returns at once when the model is already loaded.
@@ -1548,10 +1835,6 @@ class MainWindow(QtWidgets.QMainWindow):
                       stoppable=False, footer_progress=False, footer_status=False)
 
     # ---- Preview player: one Play/Pause control over audio_player's own state
-    _pv_duration = 0.0   # seconds, from the generated samples themselves
-    _pv_start = 0.0      # where Play starts when nothing is playing (set by seeking while stopped)
-    _pv_last = "stopped"
-
     def _form_sample_text(self):
         return self.txt_vd_sample.toPlainText().strip()
 
@@ -1559,92 +1842,36 @@ class MainWindow(QtWidgets.QMainWindow):
     def _sample_text_of(sample):
         return sample.get("text") or voice_library.SAMPLE_TEXT
 
-    def _preview_audio_state(self):
-        """'playing' / 'paused' / 'stopped' for the Preview's own audio. Audio that belongs to another
-        screen (a voice reference, a render) counts as stopped here."""
-        pending = self.pending_voice
-        if not pending or audio_player.current_path() != pending["preview"]:
-            return "stopped"
-        return audio_player.state()
-
-    def _pv_position(self):
-        if self._preview_audio_state() == "stopped":
-            return self._pv_start
-        return audio_player.position() or 0.0
-
     def play_sample(self):
-        pending = self.pending_voice
-        if not pending:
+        if not self.pending_voice:
             self.status("Generate a sample first.")
             return
-        state = self._preview_audio_state()
-        if state == "playing":
-            audio_player.pause() if audio_player.can_control() else audio_player.stop()
-        elif state == "paused":
-            audio_player.resume()
-        else:
-            start = self._pv_start if 0 < self._pv_start < self._pv_duration - 0.1 else 0.0
-            error = self.play(pending["preview"], start)
-            if error:
-                self._vd_notice(f"Couldn't play the sample: {error}")
-        self._refresh_audio_state()
-        self._refresh_player()
+        self.vd_player.toggle()
+
+    def _on_preview_play_failed(self, error):
+        self.status(f"Playback error: {error}")
+        self._vd_notice(f"Couldn't play the sample: {error}")
 
     def _seek_preview(self, seconds):
-        if not self.pending_voice or self._pv_duration <= 0 or not audio_player.can_control():
-            return
-        seconds = min(max(0.0, seconds), max(0.0, self._pv_duration - 0.05))
-        if self._preview_audio_state() == "stopped":
-            self._pv_start = seconds
-        else:
-            audio_player.seek(seconds)
-        self._refresh_player()
-
-    def _on_seek_slider(self, ms):
-        if not self._pv_syncing:
-            self._seek_preview(ms / 1000.0)
-
-    _pv_syncing = False
-
-    def _show_position(self, seconds):
-        self.lbl_vd_time.setText(format_duration(seconds))
-        self.sld_vd_seek.setAccessibleDescription(
-            f"{format_duration(seconds)} of {format_duration(self._pv_duration)}")
+        if self.pending_voice:
+            self.vd_player.seek(seconds)
 
     def _refresh_player(self):
         """Mirror the real playback state into the Preview. Called by the timer and after every action."""
-        if not self.pending_voice:
-            return
-        state = self._preview_audio_state()
-        if state == "stopped" and self._pv_last in ("playing", "paused"):
-            self._pv_start = 0.0   # finished or stopped: the next Play starts from the beginning
-        self._pv_last = state
-        control = audio_player.can_control()
-        playing = state == "playing"
-        label = ("Pause" if control else "Stop") if playing else "Play"
-        if self.btn_vd_play.text() != label:
-            self.btn_vd_play.setText(label)
-            icons.apply(self.btn_vd_play, ("pause" if control else "square") if playing else "play")
-            self.btn_vd_play.setToolTip({"Pause": "Pause playback", "Stop": "Stop playback"}.get(
-                label, "Resume the sample" if state == "paused" else "Play the generated sample"))
-        if state == "paused":
-            self.btn_vd_play.setToolTip("Resume playback")
-        for control_widget in (self.sld_vd_seek, self.btn_vd_back, self.btn_vd_forward):
-            control_widget.setEnabled(control)
-        position = min(self._pv_position(), self._pv_duration)
-        if not self.sld_vd_seek.isSliderDown():
-            self._pv_syncing = True
-            self.sld_vd_seek.setValue(int(position * 1000))
-            self._pv_syncing = False
-            self._show_position(position)
-        if not control:
-            self.lbl_vd_time.setText("–")
-        active = state != "stopped" or self._pv_start > 0
-        self.vd_wave.set_progress(position / self._pv_duration if active and self._pv_duration else None)
+        if self.pending_voice:
+            self.vd_player.refresh()
 
     def _tick_player(self):
-        if self.pending_voice and self.vd_preview.currentIndex() == PV_READY and self.isVisible():
+        if not self.isVisible():
+            return
+        live = False
+        if self.pending_voice and self.vd_preview.currentIndex() == PV_READY:
             self._refresh_player()
+            live = True
+        if self.vc_player.has_audio() and self.vc_player.isVisible():
+            self.vc_player.refresh()
+            live = True
+        if live:
             self._refresh_audio_state()   # the footer reads the same player state in the same tick
 
     def edit_sample_text(self):
@@ -1686,16 +1913,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         was_stale = self._sample_is_stale()  # the snapshot below keeps the sample's own inputs either way
         overwrite = False
-        if voice_library.voice_exists(name):
-            if autosaved:
-                name = voice_library.unique_voice_name(name)
-                self.edt_vd_name.setText(name)
-            else:
-                answer = QtWidgets.QMessageBox.question(
-                    self, "Overwrite voice?", f"A voice named '{name}' already exists. Replace it?")
-                if answer != QtWidgets.QMessageBox.Yes:
-                    return
-                overwrite = True
+        if voice_library.voice_exists(name) and autosaved:
+            name = voice_library.unique_voice_name(name)
+            self.edt_vd_name.setText(name)
+        else:
+            overwrite = self._confirm_replace_voice(name, blocked=self._vd_notice)
+            if overwrite is None:
+                return
 
         def work(task):
             text = self._sample_text_of(pending)   # the words actually spoken in this audio
@@ -1732,95 +1956,502 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def refresh_voice_lists(self):
         names = voice_library.list_voices()
-        self.cmb_vc_voice.clear()
-        self.cmb_vc_voice.addItems([""] + names)
+        keep = self._selected_clone_voice()
+        self._vc_syncing = True   # clearing/refilling must not look like a user choice (it would reset Language)
+        try:
+            self.cmb_vc_voice.clear()
+            self.cmb_vc_voice.addItems(names)
+            self.cmb_vc_voice.setCurrentIndex(self.cmb_vc_voice.findText(keep) if keep in names else -1)
+        finally:
+            self._vc_syncing = False
+        self.lbl_vc_empty.setVisible(not names)
+        self._refresh_voice_desc()
         if hasattr(self, "audiobook_tab"):
             self.audiobook_tab.refresh_voices()
 
     # ------------------------------------------------------------------ VoiceClone
+    # Exactly one voice source is active at a time; only it is sent to generation.
+
     def _build_clone_tab(self):
-        page, lay, bar = tab_page(None)
-        lay.addWidget(page_header("Clone Voice"))
+        page = QtWidgets.QScrollArea()
+        page.setWidgetResizable(True)
+        page.setFrameShape(QtWidgets.QFrame.NoFrame)
+        body = QtWidgets.QWidget()
+        page.setWidget(body)
+        frame = QtWidgets.QHBoxLayout(body)
+        frame.setContentsMargins(32, 32, 32, 24)
+        content = QtWidgets.QWidget()
+        content.setMaximumWidth(CONTENT_MAX_WIDTH)
+        frame.addWidget(content, 100, QtCore.Qt.AlignTop)
+        frame.addStretch(1)
+        outer = QtWidgets.QVBoxLayout(content)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(24)
+        outer.addWidget(page_header("Clone Voice", "Use a saved voice or a recording to generate speech."))
+        cols = QtWidgets.QHBoxLayout()
+        cols.setSpacing(32)
+        cols.addLayout(self._build_clone_column(), 5)
+        cols.addWidget(self._build_clone_preview(), 4, QtCore.Qt.AlignTop)
+        outer.addLayout(cols)
+        self._vc_syncing = False
+        self.btn_vc_src_saved.setChecked(True)
+        self._on_clone_source_changed()
+        self.chk_vc_npz.toggled.connect(self._on_clone_source_changed)
+        self.chk_vc_xvec.toggled.connect(self._on_clone_source_changed)
+        for w in (self.txt_vc_text, self.txt_vc_instruct, self.txt_vc_ref_text):
+            w.textChanged.connect(self._clear_clone_error)
+        for w in (self.edt_vc_ref, self.edt_vc_reuse):
+            w.textChanged.connect(self._clear_clone_error)
+        self._set_clone_preview(CV_EMPTY)
+        return page
 
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Saved voice:"))
-        self.cmb_vc_voice = QtWidgets.QComboBox()
-        self.cmb_vc_voice.setMinimumWidth(240)
-        self.cmb_vc_voice.currentTextChanged.connect(self.on_clone_voice_changed)
-        row.addWidget(self.cmb_vc_voice)
-        btn = QtWidgets.QPushButton("Refresh")
-        btn.clicked.connect(self.refresh_voice_lists)
-        row.addWidget(btn)
+    def _clone_field(self, text, buddy=None):
+        lbl = QtWidgets.QLabel(text)
+        set_role(lbl, "field")
+        if buddy is not None:
+            lbl.setBuddy(buddy)
+        return lbl
+
+    def _label_with_info(self, text, topic, tip, buddy=None, width=None):
+        """A field label with a small (i) right after it; the explanation is also its accessible description.
+        `width` gives rows of controls one shared label column so the fields line up."""
+        box = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        lbl = QtWidgets.QLabel(text)
+        set_role(lbl, "field")
+        if buddy is not None:
+            lbl.setBuddy(buddy)
+        info = InfoButton(topic, tip)
+        row.addWidget(lbl)
+        row.addWidget(info)
         row.addStretch(1)
-        lay.addLayout(row)
+        if width:
+            box.setFixedWidth(width)
+        self.info_buttons = getattr(self, "info_buttons", {})
+        self.info_buttons[topic] = info
+        return box
 
-        lay.addWidget(QtWidgets.QLabel("Text to synthesize:"))
-        self.txt_vc_text = text_edit(10, text="Hello, I am cloning this voice.")
-        lay.addWidget(self.txt_vc_text, 1)
-        lay.addWidget(DirectionBar(self.txt_vc_text))
-        help_lbl = QtWidgets.QLabel(
-            "The Base (clone) model takes no instructions, so each [tag] is performed by generating a short "
-            "emotional reference with VoiceDesign (voice description + tag), anchored to your voice's speaker "
-            "embedding, and cloning from it. Identity stays close but not identical to the neutral voice; "
-            "audition emotional passages. " + DIRECTION_HELP +
-            " The Voice Description box is used only when [emotion] tags are present; it is combined with each "
-            "tag to form the style instruct. Without tags, the box has no effect.")
-        help_lbl.setWordWrap(True)
-        set_role(help_lbl, "muted")
-        lay.addWidget(help_lbl)
+    def _build_clone_column(self):
+        col = QtWidgets.QVBoxLayout()
+        col.setSpacing(8)
 
-        form = QtWidgets.QFormLayout()
+        # ---- voice source: two explicit, exclusive modes
+        col.addWidget(self._clone_field("Voice source"))
+        seg = QtWidgets.QHBoxLayout()
+        seg.setSpacing(0)
+        self.grp_vc_source = QtWidgets.QButtonGroup(self)
+        self.grp_vc_source.setExclusive(True)
+        self.btn_vc_src_saved = QtWidgets.QPushButton("Saved voice")
+        self.btn_vc_src_ref = QtWidgets.QPushButton("Reference audio")
+        for i, b in enumerate((self.btn_vc_src_saved, self.btn_vc_src_ref)):
+            b.setCheckable(True)
+            set_role(b, "segment")
+            b.setProperty("position", "left" if i == 0 else "right")
+            self.grp_vc_source.addButton(b, i)
+            seg.addWidget(b, 1)
+        self.btn_vc_src_saved.setAccessibleDescription("Generate with a voice from your library")
+        self.btn_vc_src_ref.setAccessibleDescription("Generate by copying a recording you provide")
+        self.grp_vc_source.idToggled.connect(lambda _i, on: on and self._on_clone_source_changed())
+        col.addLayout(seg)
+
+        # ---- saved-voice panel
+        self.pnl_vc_saved = QtWidgets.QWidget()
+        sv = QtWidgets.QVBoxLayout(self.pnl_vc_saved)
+        sv.setContentsMargins(0, 8, 0, 0)
+        sv.setSpacing(8)
+        self.cmb_vc_voice = QtWidgets.QComboBox()
+        self.cmb_vc_voice.setPlaceholderText("Select a voice…")
+        self.cmb_vc_voice.setAccessibleName("Saved voice")
+        self.cmb_vc_voice.currentIndexChanged.connect(self.on_clone_voice_changed)
+        sv.addWidget(self._clone_field("Choose a saved voice", self.cmb_vc_voice))
+        pick = QtWidgets.QHBoxLayout()
+        pick.setSpacing(8)
+        pick.addWidget(self.cmb_vc_voice, 1)
+        self.btn_vc_refresh = QtWidgets.QPushButton("Refresh")
+        self.btn_vc_refresh.setToolTip("Reload the list of saved voices")
+        self.btn_vc_refresh.clicked.connect(self.refresh_voice_lists)
+        pick.addWidget(self.btn_vc_refresh)
+        sv.addLayout(pick)
+        self.lbl_vc_empty = WrapLabel("No saved voices yet. Create one, or switch to Reference audio.")
+        set_role(self.lbl_vc_empty, "muted")
+        sv.addWidget(self.lbl_vc_empty)
+        col.addWidget(self.pnl_vc_saved)
+
+        # ---- reference-audio panel
+        self.pnl_vc_ref = QtWidgets.QWidget()
+        rf = QtWidgets.QVBoxLayout(self.pnl_vc_ref)
+        rf.setContentsMargins(0, 8, 0, 0)
+        rf.setSpacing(8)
+        self.edt_vc_ref = QtWidgets.QLineEdit()
+        self.edt_vc_ref.setPlaceholderText("Choose a recording")
+        self.edt_vc_ref.setAccessibleName("Reference audio file")
+        self.btn_vc_ref_browse = QtWidgets.QPushButton("Browse…")
+        self.btn_vc_ref_browse.clicked.connect(
+            lambda: self.browse(self.edt_vc_ref, audio_file_filter()))
+        self.lbl_vc_ref = self._clone_field("Reference audio", self.edt_vc_ref)
+        rf.addWidget(self.lbl_vc_ref)
+        rf.addWidget(self.row_with(self.edt_vc_ref, self.btn_vc_ref_browse))
+        self.lbl_vc_transcript = self._clone_field("Transcript")
+        rf.addWidget(self.lbl_vc_transcript)
+        self.txt_vc_ref_text = text_edit(3, "Exact words spoken in the recording")
+        self.txt_vc_ref_text.setFixedHeight(self.txt_vc_ref_text.fontMetrics().lineSpacing() * 3 + 20)
+        self.txt_vc_ref_text.setAccessibleName("Transcript")
+        self.lbl_vc_transcript.setBuddy(self.txt_vc_ref_text)
+        rf.addWidget(self.txt_vc_ref_text)
+        self.chk_vc_xvec = QtWidgets.QCheckBox("X-vector only (no transcript needed)")
+        self.chk_vc_xvec.setToolTip(XVECTOR_TIP)
+        self.chk_vc_xvec.setAccessibleDescription(XVECTOR_TIP)
+        rf.addWidget(self.chk_vc_xvec)
+        self.lbl_vc_npz_active = WrapLabel("Using a prompt file instead (set in Advanced settings).")
+        set_role(self.lbl_vc_npz_active, "muted")
+        rf.addWidget(self.lbl_vc_npz_active)
+        col.addWidget(self.pnl_vc_ref)
+        self._vc_saved_name = None
+
+        # ---- text
+        col.addSpacing(8)
+        self.txt_vc_text = text_edit(5, text="Hello, I am cloning this voice.")
+        self.txt_vc_text.setFixedHeight(self.txt_vc_text.fontMetrics().lineSpacing() * 4 + 20)
+        self.txt_vc_text.setAccessibleName("Text to generate")
+        col.addWidget(self._clone_field("Text to generate", self.txt_vc_text))
+        col.addWidget(self.txt_vc_text)
+
+        # ---- language
+        col.addSpacing(4)
         self.cmb_vc_lang = combo(LANGUAGES, DEFAULT_LANGUAGE)
-        form.addRow("Language:", self.cmb_vc_lang)
+        self.cmb_vc_lang.setMinimumWidth(160)
+        col.addWidget(self._clone_field("Language", self.cmb_vc_lang))
+        lang_row = QtWidgets.QHBoxLayout()
+        lang_row.addWidget(self.cmb_vc_lang)
+        lang_row.addStretch(1)
+        col.addLayout(lang_row)
+
+        # ---- generate (above Advanced, like Create Voice); the problem, if any, is shown right above it
+        col.addSpacing(4)
+        self.lbl_vc_error = WrapLabel("")
+        set_role(self.lbl_vc_error, "error-text")
+        self.lbl_vc_error.setAccessibleName("Problem")
+        self.lbl_vc_error.setVisible(False)
+        col.addWidget(self.lbl_vc_error)
+        col.addSpacing(4)
+        gen = QtWidgets.QHBoxLayout()
+        self.btn_vc_generate = QtWidgets.QPushButton("Generate audio")
+        set_role(self.btn_vc_generate, "primary")
+        icons.apply(self.btn_vc_generate, "audio-lines", icons.SIZE_COMPACT, "primary")
+        self.btn_vc_generate.setMinimumWidth(180)
+        self.btn_vc_generate.clicked.connect(self.generate_clone)
+        gen.addWidget(self.btn_vc_generate)
+        gen.addStretch(1)
+        col.addLayout(gen)
+
+        self.pnl_vc_save = QtWidgets.QWidget()
+        sl = QtWidgets.QVBoxLayout(self.pnl_vc_save)
+        sl.setContentsMargins(0, 8, 0, 0)
+        sl.setSpacing(8)
+        # One description for the whole reference workflow: saved with the voice, and used for [tags] when generating here
+        self.txt_vc_instruct = text_edit(2, "e.g. Warm, gentle female voice, calm and soothing tone.")
+        self.txt_vc_instruct.setFixedHeight(self.txt_vc_instruct.fontMetrics().lineSpacing() * 2 + 20)
+        self.txt_vc_instruct.setAccessibleName("Voice description")
+        sl.addWidget(self._label_with_info("Description (optional)", "Description", DESCRIPTION_TIP,
+                                           buddy=self.txt_vc_instruct))
+        sl.addWidget(self.txt_vc_instruct)
+        # saving the recording as a voice acts on the reference, not on generated audio
+        save_row = QtWidgets.QHBoxLayout()
+        save_row.setSpacing(8)
+        self.edt_vc_new_name = QtWidgets.QLineEdit()
+        self.edt_vc_new_name.setPlaceholderText("New voice name")
+        self.edt_vc_new_name.setAccessibleName("New voice name")
+        self.btn_vc_save_voice = QtWidgets.QPushButton("Save as voice")
+        self.btn_vc_save_voice.setToolTip("Save this recording as a reusable voice (no audio is generated)")
+        self.btn_vc_save_voice.clicked.connect(self.save_clone_as_voice)
+        save_row.addWidget(self.edt_vc_new_name, 1)
+        save_row.addWidget(self.btn_vc_save_voice)
+        sl.addWidget(self._clone_field("Save the recording as a voice", self.edt_vc_new_name))
+        sl.addLayout(save_row)
+        use_row = QtWidgets.QHBoxLayout()
+        self.lbl_vc_saved_note = WrapLabel("")
+        set_role(self.lbl_vc_saved_note, "muted")
+        self.btn_vc_use_saved = QtWidgets.QPushButton("Use this voice")
+        set_role(self.btn_vc_use_saved, "quiet")
+        self.btn_vc_use_saved.clicked.connect(self.use_saved_clone_voice)
+        use_row.addWidget(self.lbl_vc_saved_note, 1)
+        use_row.addWidget(self.btn_vc_use_saved)
+        self.row_vc_use = QtWidgets.QWidget()
+        self.row_vc_use.setLayout(use_row)
+        use_row.setContentsMargins(0, 0, 0, 0)
+        self.row_vc_use.setVisible(False)
+        sl.addWidget(self.row_vc_use)
+        col.addWidget(self.pnl_vc_save)
+        # ---- advanced (collapsed): technical controls, semantics unchanged
+        col.addSpacing(8)
+        divider = QtWidgets.QFrame()
+        set_role(divider, "divider")
+        col.addWidget(divider)
+        adv_row = QtWidgets.QHBoxLayout()
+        self.btn_vc_advanced = QtWidgets.QPushButton("Advanced settings")
+        self.btn_vc_advanced.setCheckable(True)
+        self.btn_vc_advanced.setAccessibleName("Advanced settings")
+        set_role(self.btn_vc_advanced, "quiet")
+        self.btn_vc_advanced.toggled.connect(self._toggle_clone_advanced)
+        adv_row.addWidget(self.btn_vc_advanced)
+        adv_row.addStretch(1)
+        col.addLayout(adv_row)
+        self.vc_advanced = self._build_clone_advanced()
+        self.vc_advanced.setVisible(False)
+        col.addWidget(self.vc_advanced)
+        self._set_clone_advanced_icon(False)
+        col.addStretch(1)
+        return col
+
+    def _build_clone_advanced(self):
+        panel = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+
+        lay.addWidget(self._label_with_info("Direction tags", "Direction tags", DIRECTION_TAGS_TIP))
+        self.dir_vc = DirectionBar(self.txt_vc_text)
+        lay.addWidget(self.dir_vc)
+
+        # Saved voice mode only: shows what the voice was saved with. The editable description lives beside Save as voice.
+        self.lbl_vc_description = self._clone_field("Voice description (from the saved voice)")
+        lay.addWidget(self.lbl_vc_description)
+        self.lbl_vc_voice_desc = WrapLabel("")
+        self.lbl_vc_voice_desc.setAccessibleName("Saved voice description")
+        set_role(self.lbl_vc_voice_desc, "muted")
+        lay.addWidget(self.lbl_vc_voice_desc)
+
+        # numeric fields use the shared field style (role "numeric"): the stepper buttons take no space and draw nothing,
+        # while typing, the arrow keys and the mouse wheel still step by the same amounts
         self.cmb_vc_seed_mode, self.spn_vc_seed = seed_row("Fixed", 42)
         self.spn_vc_temp = QtWidgets.QDoubleSpinBox()
         self.spn_vc_temp.setRange(0.1, 1.5)
         self.spn_vc_temp.setSingleStep(0.05)
         self.spn_vc_temp.setValue(0.7)
-        self.spn_vc_temp.setToolTip("Lower = steadier voice, flatter delivery. Library default is 0.9.")
-        r = QtWidgets.QHBoxLayout()
-        for w in (self.cmb_vc_seed_mode, self.spn_vc_seed, QtWidgets.QLabel("Temperature:"), self.spn_vc_temp):
-            r.addWidget(w)
-        r.addStretch(1)
-        form.addRow("Seed:", r)
-        lay.addLayout(form)
+        style_numeric(self.spn_vc_temp, name="Temperature")
+        seed_lay = QtWidgets.QHBoxLayout()
+        seed_lay.setSpacing(8)
+        seed_lay.addWidget(self._label_with_info("Seed", "Seed", SEED_TIP, buddy=self.cmb_vc_seed_mode, width=SETTING_LABEL_WIDTH))
+        seed_lay.addWidget(self.cmb_vc_seed_mode)
+        seed_lay.addWidget(self.spn_vc_seed)
+        seed_lay.addStretch(1)
+        lay.addLayout(seed_lay)
+        temp_lay = QtWidgets.QHBoxLayout()
+        temp_lay.setSpacing(8)
+        temp_lay.addWidget(self._label_with_info("Temperature", "Temperature", TEMPERATURE_TIP, buddy=self.spn_vc_temp, width=SETTING_LABEL_WIDTH))
+        temp_lay.addWidget(self.spn_vc_temp)
+        temp_lay.addStretch(1)
+        lay.addLayout(temp_lay)
 
-        lay.addWidget(QtWidgets.QLabel("Voice description (used for [tag] direction; filled from a saved voice):"))
-        self.txt_vc_instruct = text_edit(3, "e.g. Warm, gentle female voice, calm and soothing tone.")
-        lay.addWidget(self.txt_vc_instruct)
-
-        self.grp_ref = QtWidgets.QGroupBox("Or clone from reference audio (ignored when a saved voice is selected)")
-        g = QtWidgets.QFormLayout(self.grp_ref)
-        self.edt_vc_ref = QtWidgets.QLineEdit()
-        b1 = QtWidgets.QPushButton("Browse…")
-        b1.clicked.connect(lambda: self.browse(self.edt_vc_ref, "Audio (*.wav *.mp3 *.flac *.m4a *.ogg)"))
-        g.addRow("Reference audio:", self.row_with(self.edt_vc_ref, b1))
-        self.txt_vc_ref_text = text_edit(3, "Exact transcript of the reference audio")
-        g.addRow("Transcript:", self.txt_vc_ref_text)
-        self.chk_vc_xvec = QtWidgets.QCheckBox("X-vector only (speaker embedding only, no transcript needed)")
-        g.addRow("", self.chk_vc_xvec)
+        # a reusable prompt is an alternative to reference audio, never combined with it
+        self.pnl_vc_npz = QtWidgets.QWidget()
+        nz = QtWidgets.QVBoxLayout(self.pnl_vc_npz)
+        nz.setContentsMargins(0, 0, 0, 0)
+        nz.setSpacing(8)
+        self.chk_vc_npz = QtWidgets.QCheckBox("Use a prompt file instead of the recording")
+        tip = "When on, the prompt file is the only source and the recording fields are ignored. " + PROMPT_FILE_TIP
+        self.chk_vc_npz.setToolTip(tip)
+        self.chk_vc_npz.setAccessibleDescription(tip)
+        nz.addWidget(self.chk_vc_npz)
         self.edt_vc_reuse = QtWidgets.QLineEdit()
-        b2 = QtWidgets.QPushButton("Browse…")
-        b2.clicked.connect(lambda: self.browse(self.edt_vc_reuse, "NPZ (*.npz)"))
-        g.addRow("Reuse prompt (NPZ):", self.row_with(self.edt_vc_reuse, b2))
+        self.edt_vc_reuse.setPlaceholderText("Choose a prompt file (.npz)")
+        self.edt_vc_reuse.setAccessibleName("Prompt file to reuse")
+        self.btn_vc_reuse_browse = QtWidgets.QPushButton("Browse…")
+        self.btn_vc_reuse_browse.clicked.connect(lambda: self.browse(self.edt_vc_reuse, "NPZ (*.npz)"))
+        self.row_vc_reuse = self.row_with(self.edt_vc_reuse, self.btn_vc_reuse_browse)
+        nz.addWidget(self.row_vc_reuse)
+        lay.addWidget(self.pnl_vc_npz)
+
         self.edt_vc_save = QtWidgets.QLineEdit()
-        b3 = QtWidgets.QPushButton("Browse…")
-        b3.clicked.connect(lambda: self.browse(self.edt_vc_save, "NPZ (*.npz)", save=True))
-        g.addRow("Save prompt to (NPZ):", self.row_with(self.edt_vc_save, b3))
+        self.edt_vc_save.setPlaceholderText("Optional: save the prompt used (.npz)")
+        self.edt_vc_save.setAccessibleName("Save prompt to")
+        self.btn_vc_save_browse = QtWidgets.QPushButton("Browse…")
+        self.btn_vc_save_browse.clicked.connect(lambda: self.browse(self.edt_vc_save, "NPZ (*.npz)", save=True))
+        lay.addWidget(self._clone_field("Save prompt to (NPZ)", self.edt_vc_save))
+        lay.addWidget(self.row_with(self.edt_vc_save, self.btn_vc_save_browse))
+        return panel
 
-        self.edt_vc_new_name = QtWidgets.QLineEdit()
-        self.edt_vc_new_name.setPlaceholderText("New voice name")
-        btn_vc_new = QtWidgets.QPushButton("Save as voice")
-        btn_vc_new.clicked.connect(self.save_clone_as_voice)
-        g.addRow("Save this clone as a voice:", self.row_with(self.edt_vc_new_name, btn_vc_new))
-        lay.addWidget(self.grp_ref)
+    def _toggle_clone_advanced(self, on):
+        self.vc_advanced.setVisible(on)
+        self._set_clone_advanced_icon(on)
 
-        self.btn_vc_generate = QtWidgets.QPushButton("Generate")
-        set_role(self.btn_vc_generate, "primary")
-        self.btn_vc_generate.clicked.connect(self.generate_clone)
-        bar.addWidget(self.btn_vc_generate)
-        bar.addStretch(1)
-        return page
+    def _set_clone_advanced_icon(self, expanded):
+        icons.apply(self.btn_vc_advanced, "chevron-down" if expanded else "chevron-right")
+        self.btn_vc_advanced.setAccessibleDescription("Expanded" if expanded else "Collapsed")
+
+    # ---- right column: a small result surface (state text only; the shared player is a later phase)
+    def _build_clone_preview(self):
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("previewPanel")
+        self.clone_preview_panel = panel
+        panel.setMinimumWidth(340)
+        lay = QtWidgets.QVBoxLayout(panel)
+        lay.setContentsMargins(20, 16, 20, 20)
+        lay.setSpacing(12)
+        title = QtWidgets.QLabel("Preview")
+        set_role(title, "heading")
+        lay.addWidget(title)
+        self.lbl_vc_pv_title = WrapLabel("")
+        set_role(self.lbl_vc_pv_title, "notice")
+        self.lbl_vc_pv_title.setAccessibleName("Preview status")
+        lay.addWidget(self.lbl_vc_pv_title)
+        self.lbl_vc_pv_detail = WrapLabel("")
+        set_role(self.lbl_vc_pv_detail, "muted")
+        lay.addWidget(self.lbl_vc_pv_detail)
+        err_row = QtWidgets.QHBoxLayout()
+        err_row.setSpacing(8)
+        self.btn_vc_details = QtWidgets.QPushButton("Show details")
+        self.btn_vc_details.setAccessibleName("Technical details")
+        self.btn_vc_details.setToolTip("Show the technical details of this failure (private paths and credentials removed)")
+        set_role(self.btn_vc_details, "quiet")
+        icons.apply(self.btn_vc_details, "chevron-right")
+        self.btn_vc_details.clicked.connect(lambda: self._open_failure_dialog(self._clone_failure_details))
+        self.btn_vc_error_settings = QtWidgets.QPushButton("Open Settings")
+        set_role(self.btn_vc_error_settings, "quiet")
+        icons.apply(self.btn_vc_error_settings, "settings")
+        self.btn_vc_error_settings.clicked.connect(lambda: self.show_page(len(self.nav_buttons) - 1))
+        for b in (self.btn_vc_details, self.btn_vc_error_settings):
+            b.setVisible(False)
+            err_row.addWidget(b)
+        err_row.addStretch(1)
+        lay.addLayout(err_row)
+        self.lbl_vc_pv_prev = QtWidgets.QLabel("Previous audio")
+        set_role(self.lbl_vc_pv_prev, "field")
+        self.lbl_vc_pv_prev.setVisible(False)
+        lay.addWidget(self.lbl_vc_pv_prev)
+        self.vc_player = PreviewPlayer("audio")
+        self.vc_player.setVisible(False)
+        self.vc_player.changed.connect(self._refresh_audio_state)
+        self.vc_player.failed.connect(self._on_clone_play_failed)
+        lay.addWidget(self.vc_player)
+        lay.addStretch(1)
+        return panel
+
+    def _on_clone_play_failed(self, error):
+        self.status(f"Playback error: {error}")
+        self.lbl_vc_pv_detail.setText(f"Couldn't play the audio: {error}")
+
+    def _set_clone_preview(self, state, detail="", audio=None):
+        """One state at a time: EMPTY, BUSY, READY, PARTIAL (stopped early, audio kept), STOPPED (stopped, no audio),
+        ERROR, SAVED (the audio was generated and saved, only the Preview couldn't load it). `audio` = (path,
+        samples, sample_rate) for READY and PARTIAL, which replace the player's audio. BUSY, STOPPED, ERROR and
+        SAVED keep the previous audio on screen (as Create Voice keeps its last sample)."""
+        self._vc_pv_state = state
+        replaces = state in (CV_READY, CV_PARTIAL) and audio is not None
+        keeps = state in (CV_BUSY, CV_STOPPED, CV_ERROR, CV_SAVED) and self.vc_player.has_audio()
+        had_previous = self.vc_player.has_audio()
+        title = {CV_EMPTY: "Your generated audio will appear here.",
+                 CV_BUSY: "Generating audio…",
+                 CV_READY: "Audio ready",
+                 CV_PARTIAL: "Stopped early",
+                 CV_STOPPED: "Stopped before any audio was produced",
+                 CV_SAVED: "Audio saved. Preview unavailable",
+                 CV_ERROR: "Couldn't generate new audio" if had_previous else "Couldn't generate the audio"}[state]
+        if state == CV_STOPPED:
+            detail = detail or ("Nothing new was saved. Your previous audio is still available." if had_previous
+                                else "Nothing was saved.")
+        detail = detail or {CV_EMPTY: "Choose a voice, enter your text, then generate audio."}.get(state, "")
+        focus = QtWidgets.QApplication.focusWidget()
+        if replaces:
+            self.vc_player.clear()        # stops the previous audio if it is the one playing, then loads the new file
+            self.vc_player.set_audio(*audio)
+        elif not keeps:
+            self.vc_player.clear()
+        self.vc_player.setVisible(replaces or keeps)
+        self.lbl_vc_pv_prev.setVisible(keeps)
+        for b in (self.btn_vc_details, self.btn_vc_error_settings):
+            b.setVisible(False)           # _show_clone_error turns these on for a failure
+        self.lbl_vc_pv_title.setText(title)
+        self.lbl_vc_pv_detail.setMinimumHeight(0)   # WrapLabel only recomputes its reserved height upward from a stale value
+        self.lbl_vc_pv_detail.setText(detail)
+        self.lbl_vc_pv_detail.setVisible(bool(detail))
+        if focus is not None and self.clone_preview_panel.isAncestorOf(focus) and not focus.isVisibleTo(self.clone_preview_panel):
+            self.txt_vc_text.setFocus()   # the control that had focus just disappeared; keep focus on something visible
+        if state in (CV_ERROR, CV_PARTIAL, CV_SAVED):
+            QtGui.QAccessible.updateAccessibility(QtGui.QAccessibleEvent(self.lbl_vc_pv_title, QtGui.QAccessible.Event.Alert))
+
+    def _store_clone_details(self, failure, task):
+        device, dtype, attn = self.model_settings()
+        self._clone_failure_details = task_errors.details_text(failure, task=task, context={
+            "Model": MODEL_MAP["voice-clone"],
+            "Settings": f"device={device}, dtype={dtype}, attention={attn}",
+            "Language": self.cmb_vc_lang.currentText(),
+            "Source": self.clone_source_kind()})
+
+    def _show_clone_saved_without_preview(self, path, early, exc):
+        """The audio was generated and written; only reading it back for the Preview failed. That is not a failed
+        generation: say it was saved, where, and that the footer's Play last output / Open output folder still work."""
+        self._store_clone_details(task_errors.Failure.from_exception(exc), "Clone Voice Preview")
+        lead = "Stopped early; only the part generated so far was saved. " if early else ""
+        self._set_clone_preview(CV_SAVED, f"{lead}Saved to {path}. The Preview couldn't load this file. "
+                                          "Use Play last output or Open output folder below to reach it.")
+        self.btn_vc_details.setVisible(True)
+
+    def _show_clone_error(self, message, failure=None):
+        """Explain a failed generation the way Create Voice does: a cause only when it is reliably identifiable, an
+        action, and sanitized technical details on request. The raw exception text is never put in the Preview."""
+        failure = failure or (getattr(self.task, "failure", None) if self.task else None) \
+            or task_errors.Failure.from_message(message)
+        explanation = task_errors.classify(failure, noun="audio")
+        summary = explanation.summary if explanation else task_errors.UNKNOWN_SUMMARY_AUDIO
+        action = explanation.action if explanation else task_errors.UNKNOWN_ACTION_AUDIO
+        self._store_clone_details(failure, "Clone Voice audio")
+        had_previous = self.vc_player.has_audio()
+        self._set_clone_preview(CV_ERROR, f"{summary} {action}" + (" Your previous audio is still available." if had_previous else ""))
+        self.btn_vc_details.setVisible(True)
+        self.btn_vc_error_settings.setVisible(bool(explanation and explanation.settings))
+        self.status(f"Couldn't generate the audio: {explanation.short}." if explanation
+                    else "Couldn't generate the audio. See the Preview for details.")
+
+    # ---- source state
+    def clone_source_kind(self):
+        """'saved', 'reference' or 'prompt': the one source generation will use."""
+        if self.btn_vc_src_saved.isChecked():
+            return "saved"
+        return "prompt" if self.chk_vc_npz.isChecked() else "reference"
+
+    def _on_clone_source_changed(self, *_):
+        saved = self.btn_vc_src_saved.isChecked()
+        # one tab stop for the pair (the selected one); the arrow keys move between them
+        self.btn_vc_src_saved.setFocusPolicy(QtCore.Qt.StrongFocus if saved else QtCore.Qt.ClickFocus)
+        self.btn_vc_src_ref.setFocusPolicy(QtCore.Qt.ClickFocus if saved else QtCore.Qt.StrongFocus)
+        npz = self.chk_vc_npz.isChecked() and not saved
+        self.pnl_vc_saved.setVisible(saved)
+        self.pnl_vc_ref.setVisible(not saved)
+        self.pnl_vc_npz.setVisible(not saved)
+        self.pnl_vc_save.setVisible(not saved)
+        # the other source's entries are kept, but greyed out and never sent
+        for w in (self.edt_vc_ref, self.btn_vc_ref_browse, self.chk_vc_xvec):
+            w.setEnabled(not npz)
+        self.txt_vc_ref_text.setEnabled(not npz and not self.chk_vc_xvec.isChecked())
+        self.lbl_vc_npz_active.setVisible(npz)
+        self.btn_vc_save_voice.setEnabled(not npz)
+        self.edt_vc_new_name.setEnabled(not npz)
+        self.row_vc_reuse.setEnabled(npz)
+        self.lbl_vc_description.setVisible(saved)
+        self.lbl_vc_voice_desc.setVisible(saved)
+        self._refresh_voice_desc()
+        self._clear_clone_error()
+
+    def _refresh_voice_desc(self):
+        name = self._selected_clone_voice()
+        desc = self._saved_voice_description(name) if name else ""
+        self.lbl_vc_voice_desc.setText(desc or ("This voice has no description, so [tags] can't be used."
+                                                if name else "Choose a voice to see its description."))
+
+    @staticmethod
+    def _saved_voice_description(name):
+        try:
+            with open(os.path.join(voice_library.voice_dir(name), "voice.json"), encoding="utf-8") as f:
+                return (json.load(f).get("description") or "").strip()
+        except (OSError, ValueError):
+            return ""
+
+    def _selected_clone_voice(self):
+        """The chosen saved voice, or None. The combo has no blank entry, so there is no hidden 'none' mode."""
+        return self.cmb_vc_voice.currentText() if self.cmb_vc_voice.currentIndex() >= 0 else None
 
     @staticmethod
     def row_with(edit, button):
@@ -1837,70 +2468,259 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             edit.setText(path)
 
-    def on_clone_voice_changed(self, name):
-        self.grp_ref.setEnabled(not name)
-        if name:
-            try:
-                cfg, _, _ = voice_library.load_voice(name)
-            except Exception as e:
-                self.status(f"Could not load voice: {e}")
-                return
-            self.txt_vc_instruct.setPlainText(cfg["description"])
-            self.cmb_vc_lang.setCurrentText(cfg["language"])
-            self.status(f"Using saved voice '{name}'.")
-
-    def generate_clone(self):
-        text = self.txt_vc_text.toPlainText().strip()
-        if not text:
-            self.status("Error: no text provided.")
+    def on_clone_voice_changed(self, _index=None):
+        """A user's choice prefills Language; list refreshes and clearing never touch the form."""
+        if self._vc_syncing:
             return
-        args = dict(
-            text=text, language=self.cmb_vc_lang.currentText(),
+        name = self._selected_clone_voice()
+        self._refresh_voice_desc()
+        self._clear_clone_error()
+        if not name:
+            return
+        try:
+            cfg, _, _ = voice_library.load_voice(name)
+        except Exception as e:
+            self.status(f"Could not load voice: {e}")
+            return
+        if cfg.get("language") in LANGUAGES:
+            self.cmb_vc_lang.setCurrentText(cfg["language"])
+        self.status(f"Using saved voice '{name}'.")
+
+    def _clear_clone_error(self, *_):
+        self.lbl_vc_error.setVisible(False)
+        self.lbl_vc_error.setText("")
+
+    def _clone_error(self, message, widget=None, advanced=False):
+        """Show a problem next to the form and move focus to the field that needs fixing."""
+        self.lbl_vc_error.setText(message)
+        self.lbl_vc_error.setVisible(True)
+        self.status(f"Error: {message}")
+        if advanced and not self.btn_vc_advanced.isChecked():
+            self.btn_vc_advanced.setChecked(True)
+        if widget is not None:
+            widget.setFocus()
+        return False
+
+    def _validate_clone(self, for_save=False):
+        """Check everything the model would need, before it is loaded. True when generation can start."""
+        kind = "reference" if for_save else self.clone_source_kind()
+        text = self.txt_vc_text.toPlainText().strip()
+        if not for_save and not text:
+            return self._clone_error("Enter the text to generate.", self.txt_vc_text)
+        if kind == "saved":
+            name = self._selected_clone_voice()
+            if not name:
+                return self._clone_error("Choose a saved voice.", self.cmb_vc_voice)
+            if not voice_library.voice_exists(name):
+                return self._clone_error(f"The voice '{name}' is no longer available. Refresh the list.",
+                                         self.btn_vc_refresh)
+        elif kind == "prompt":
+            path = self.edt_vc_reuse.text().strip()
+            if not path:
+                return self._clone_error("Choose a prompt file, or turn off 'Use a saved prompt file'.",
+                                         self.edt_vc_reuse, advanced=True)
+            if not os.path.isfile(path):
+                return self._clone_error("The prompt file was not found.", self.edt_vc_reuse, advanced=True)
+        else:
+            path = self.edt_vc_ref.text().strip()
+            if not path:
+                return self._clone_error("Choose a reference recording.", self.edt_vc_ref)
+            if not os.path.isfile(path):
+                return self._clone_error("The reference recording was not found.", self.edt_vc_ref)
+            if for_save and os.path.splitext(path)[1].lower() != ".wav":
+                return self._clone_error("Saving a voice needs a WAV recording.", self.edt_vc_ref)
+            problem = audio_problem(path)   # header only: an unsupported or damaged file is explained before any model loads
+            if problem:
+                return self._clone_error(problem, self.edt_vc_ref)
+            if not self.chk_vc_xvec.isChecked() and not self.txt_vc_ref_text.toPlainText().strip():
+                return self._clone_error(
+                    "Enter the transcript of the recording, or choose X-vector only.", self.txt_vc_ref_text)
+        if not for_save:
+            has_tags = any(emotion for emotion, _ in parse_emotion_segments(text))
+            if has_tags:
+                if kind == "saved":
+                    if not self._saved_voice_description(self._selected_clone_voice()):
+                        return self._clone_error(
+                            "This voice has no saved description, so [tags] can't be used. Remove the tags.",
+                            self.txt_vc_text)
+                elif not self.txt_vc_instruct.toPlainText().strip():
+                    return self._clone_error("Describe the voice (the Description field above Save as voice) to use [emotion] tags.",
+                                             self.txt_vc_instruct)
+                if kind == "prompt":
+                    try:
+                        prompt = load_voice_clone_prompt(self.edt_vc_reuse.text().strip())
+                    except Exception as e:
+                        return self._clone_error(f"The prompt file couldn't be read: {e}",
+                                                 self.edt_vc_reuse, advanced=True)
+                    if not isinstance(prompt, list):
+                        return self._clone_error(
+                            "[Tags] need a prompt saved as a list; rebuild this prompt file.",
+                            self.edt_vc_reuse, advanced=True)
+        self._clear_clone_error()
+        return True
+
+    def clone_args(self):
+        """Arguments for generation: only the active source is filled; every other source stays empty."""
+        kind = self.clone_source_kind()
+        src = dict(voice_name=None, ref_audio="", ref_text=None, x_vector_only=False, reuse_prompt=None)
+        if kind == "saved":
+            src["voice_name"] = self._selected_clone_voice()
+        elif kind == "prompt":
+            src["reuse_prompt"] = self.edt_vc_reuse.text().strip()
+        else:
+            xvec = self.chk_vc_xvec.isChecked()
+            src.update(ref_audio=self.edt_vc_ref.text().strip(), x_vector_only=xvec,
+                       ref_text=None if xvec else (self.txt_vc_ref_text.toPlainText().strip() or None))
+        return dict(
+            text=self.txt_vc_text.toPlainText().strip(), language=self.cmb_vc_lang.currentText(),
             min_words=self.spn_min.value(), max_words=self.spn_max.value(),
             seed=self.spn_vc_seed.value() if self.cmb_vc_seed_mode.currentText() == "Fixed" else None,
             temperature=self.spn_vc_temp.value(),
-            voice_name=self.cmb_vc_voice.currentText() or None,
-            ref_audio=self.edt_vc_ref.text().strip(),
-            ref_text=self.txt_vc_ref_text.toPlainText().strip() or None,
-            x_vector_only=self.chk_vc_xvec.isChecked(),
-            reuse_prompt=self.edt_vc_reuse.text().strip() or None,
             save_prompt=self.edt_vc_save.text().strip() or None,
-            description=self.txt_vc_instruct.toPlainText(),
+            description="" if kind == "saved" else self.txt_vc_instruct.toPlainText(),
+            **src,
         )
-        self.run_task(lambda t: self.generator(t).clone(**args), self.finish_long_form("VoiceClone"))
+
+    def generate_clone(self):
+        if self.busy:
+            self.status("Busy: a task is already running.")
+            return   # the current Preview must survive a refused click
+        if not self._validate_clone():
+            return
+        args = self.clone_args()
+        on_done = self.finish_long_form("VoiceClone")
+        made = {}
+        self.vc_player.stop()   # like Create Voice: playback ends when a generation starts, the previous audio stays loaded
+        self._set_clone_preview(CV_BUSY, "Getting ready…")   # a previous result stays on screen until the new one is ready
+
+        def work(task):
+            made["generator"] = self.generator(task)
+            return made["generator"].clone(**args)
+
+        def done(result):
+            wavs = result[0]
+            stop_pressed = bool(self.task and self.task.stop_event.is_set())
+            # Stop only means "early" when chunks were really skipped; pressed after the last chunk the audio is complete.
+            expected = getattr(made.get("generator"), "clone_chunks", None)
+            early = stop_pressed and (len(wavs) < expected if expected is not None else True)
+            try:
+                path = on_done(result, early=early)   # writes the file, sets last_output and the footer status
+            except Exception as exc:                  # nothing usable was written: a real failure
+                self._show_clone_error(str(exc), task_errors.Failure.from_exception(exc))
+                return
+            audio = None
+            if path:
+                try:
+                    samples, rate = load_wav(path)
+                    audio = (path, samples, rate)
+                except Exception as exc:              # the file exists; only the Preview can't show it
+                    self._show_clone_saved_without_preview(path, early, exc)
+                    return
+            if audio is None:
+                self._set_clone_preview(CV_STOPPED)
+            elif early:
+                self._set_clone_preview(CV_PARTIAL, f"Only the part generated so far was saved to {path}", audio)
+            else:
+                self._set_clone_preview(CV_READY, f"Saved to {path}", audio)
+
+        self.run_task(work, done, on_fail=self._show_clone_error,
+                      on_notify=lambda m: self._vc_pv_state == CV_BUSY and self.lbl_vc_pv_detail.setText(m))
 
     def save_clone_as_voice(self):
         """Build a clone prompt from reference audio and save it as a named voice."""
+        if self.busy:
+            self.status("Busy: a task is already running.")
+            return
         name = self.edt_vc_new_name.text().strip()
         if not voice_library.slugify(name):
-            self.status("Error: enter a voice name.")
+            self._clone_error("Enter a name for the voice.", self.edt_vc_new_name)
+            return
+        if not self._validate_clone(for_save=True):
+            return
+        overwrite = self._confirm_replace_voice(name)
+        if overwrite is None:
             return
         ref_audio = self.edt_vc_ref.text().strip()
-        if not ref_audio:
-            self.status("Error: provide reference audio first.")
-            return
-        ref_text = self.txt_vc_ref_text.toPlainText().strip() or None
+        ref_text = None if self.chk_vc_xvec.isChecked() else (self.txt_vc_ref_text.toPlainText().strip() or None)
         x_vector_only = self.chk_vc_xvec.isChecked()
         language = self.cmb_vc_lang.currentText()
         description = self.txt_vc_instruct.toPlainText().strip()
+        # Exactly what clone() would pass for [tag] emotion samples from this form: the Fixed value, or 0 when Random
+        # (tts_generator uses `seed or 0` for them). Recording anything else would describe a voice nobody heard.
         seed = self.spn_vc_seed.value() if self.cmb_vc_seed_mode.currentText() == "Fixed" else 0
+        sample_text = ref_text or ""   # the exact transcript the user supplied; empty when there is none (X-vector only)
 
         def work(task):
             wav, sr = load_wav(ref_audio)
             prompt = self.generator(task).build_clone_prompt(
                 ref_audio=(wav, sr), ref_text=ref_text, x_vector_only=x_vector_only)
-            overwrite = voice_library.voice_exists(name)
             voice_library.save_voice(
                 name, wav, sr, prompt, description, language, seed,
-                model_ids=dict(MODEL_MAP), overwrite=overwrite)
+                model_ids=dict(MODEL_MAP), overwrite=overwrite,   # decided on the GUI thread, never here
+                sample_text=sample_text)
             return name
 
         def done(saved_name):
             self.refresh_voice_lists()
-            self.cmb_vc_voice.setCurrentText(saved_name)
+            self._vc_saved_name = saved_name
+            self.lbl_vc_saved_note.setText(f"Saved '{saved_name}'.")
+            self.btn_vc_use_saved.setText(f"Use '{saved_name}'")
+            self.row_vc_use.setVisible(True)
             self.status(f"Voice '{saved_name}' saved to voices/{voice_library.slugify(saved_name)}/")
 
-        self.run_task(work, done, stoppable=False)
+        self.run_task(work, done, on_fail=lambda m: self._clone_error(m, self.edt_vc_new_name), stoppable=False)
+
+    def _confirm_replace_voice(self, name, blocked=None):
+        """None = cancelled/blocked, False = the name is free, True = the user agreed to replace it.
+        Decided here, on the GUI thread; save_voice only replaces when told to. `blocked(message)` reports a
+        folder that is not a voice (default: the Clone error line)."""
+        path = voice_library.voice_dir(name)
+        if not os.path.lexists(path):
+            return False
+        if not voice_library.voice_exists(name):
+            message = (f"A folder named '{os.path.basename(path)}' already exists in the voices folder "
+                       "but isn't a voice. Choose another name.")
+            if blocked:
+                blocked(message)
+            else:
+                self._clone_error(message, self.edt_vc_new_name)
+            return None
+        existing = name
+        try:
+            with open(os.path.join(path, "voice.json"), encoding="utf-8") as f:
+                existing = json.load(f).get("name") or name
+        except (OSError, ValueError):
+            pass
+        lost = voice_library.describe_voice_assets(name)
+        detail = ("Replacing it deletes " + (", ".join(lost[:-1]) + " and " + lost[-1] if len(lost) > 1 else
+                  (lost[0] if lost else "its files")) + ". They belong to the old recording and can't be kept "
+                  "for the new one. The replacement is written first, so if saving fails the existing voice stays as it is.")
+        if existing.strip().lower() != name.strip().lower():
+            detail = (f"'{name}' and '{existing}' share the folder '{os.path.basename(path)}'. ") + detail
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("Replace voice?")
+        box.setText(f"A voice named '{existing}' already exists.")
+        box.setInformativeText(detail)
+        replace = box.addButton("Replace", QtWidgets.QMessageBox.DestructiveRole)
+        keep = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        return True if box.clickedButton() is replace else None
+
+    def use_saved_clone_voice(self):
+        """Explicit switch to the voice that was just saved; saving never changes the source by itself."""
+        name = self._vc_saved_name
+        if not name:
+            return
+        self.refresh_voice_lists()
+        idx = self.cmb_vc_voice.findText(name)
+        self.btn_vc_src_saved.setChecked(True)
+        if idx >= 0:
+            self.cmb_vc_voice.setCurrentIndex(idx)
+        self.row_vc_use.setVisible(False)
+        self.cmb_vc_voice.setFocus()   # the button that had focus was just hidden
 
     # ------------------------------------------------------------------ Voices tab
     def _build_voices_tab(self):
@@ -2239,7 +3059,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def create_voice_from_audio(self):
         """Build a new voice from a WAV file + transcript (no model generation needed for the prompt)."""
         wav_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select reference audio", "", "Audio (*.wav *.mp3 *.flac *.m4a *.ogg)")
+            self, "Select reference audio", "", audio_file_filter())
         if not wav_path:
             return
         name, ok = QtWidgets.QInputDialog.getText(
@@ -2269,7 +3089,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ref_audio=(wav, sr), ref_text=None, x_vector_only=True)
             voice_library.save_voice(
                 name, wav, sr, prompt, description, language, seed,
-                model_ids=dict(MODEL_MAP), overwrite=False)
+                model_ids=dict(MODEL_MAP), overwrite=False, sample_text="")   # X-vector only: no transcript
             return name
 
         def done(saved_name):

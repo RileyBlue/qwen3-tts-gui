@@ -8,3 +8,7 @@ voices/
 # Python
 __pycache__/
 *.pyc
+
+# Finder
+.DS_Store
+**/.DS_Store

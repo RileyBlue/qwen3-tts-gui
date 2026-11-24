@@ -7,7 +7,7 @@ from PySide6 import QtCore, QtWidgets
 import audiobook
 from audio_utils import write_wav
 from config import DEFAULT_LANGUAGE, LANGUAGES, OUTPUT_DIR
-from theme import set_role
+from theme import set_role, style_numeric
 from voice_lock import EMOTION_PRESETS
 
 COL_NUM, COL_TYPE, COL_VOICE, COL_DIR, COL_TEXT = range(5)
@@ -112,6 +112,8 @@ class AudiobookTab(QtWidgets.QWidget):
         self.spn_temp.setRange(0.1, 1.5)
         self.spn_temp.setSingleStep(0.05)
         self.spn_temp.setValue(0.7)
+        style_numeric(self.spn_pause, width="fit", name="Pause between segments")
+        style_numeric(self.spn_temp, width="fit", name="Clone temperature")
         for label, w in (("Pause between segments:", self.spn_pause), ("", self.chk_loudness),
                          ("Seed:", self.cmb_seed_mode), ("", self.spn_seed),
                          ("Clone temperature:", self.spn_temp)):

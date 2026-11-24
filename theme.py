@@ -6,7 +6,7 @@ opt into variants with `set_role` (a dynamic `role` property) instead of inline 
 
 Roles
   QPushButton: "primary" (one per screen), "quiet" (no chrome), "nav" (sidebar item),
-               "chip" (checkable suggestion)
+               "chip" (checkable suggestion), "segment" (two-way source switch), "info" (the (i) beside a label)
   QLabel:      "title", "subtitle", "heading", "field", "caption", "muted", "pill",
                "brand", "error-title", "notice"
   QFrame:      "divider", "callout"; QListWidget: "voices" (My Voices rows); object names "sidebar", "footer", "previewPanel"
@@ -89,6 +89,7 @@ def build_qss(c=COLORS, arrow=None):
                   if arrow else "")
     f = FONT_PX
     return f"""
+QLabel#infoPopup {{ background: {c['surface']}; color: {c['text']}; border: 1px solid {c['border_control']}; border-radius: 6px; padding: 8px 10px; }}
 QToolTip {{ background: {c['surface']}; color: {c['text']}; border: 1px solid {c['border']}; padding: 4px 6px; }}
 
 /* ---- buttons: 36 px standard, 42 px primary */
@@ -126,6 +127,13 @@ QPushButton[role="quiet"]:hover {{ background: {c['surface_hover']}; color: {c['
 QPushButton[role="quiet"]:focus {{ border: 2px solid {c['accent']}; padding: 6px 9px; }}
 QPushButton[role="quiet"]:disabled {{ background: transparent; border-color: transparent; color: {c['text_disabled']}; }}
 
+QPushButton[role="info"] {{
+    background: transparent; border: 2px solid transparent; border-radius: 11px; padding: 0;
+    min-width: 18px; max-width: 18px; min-height: 18px; max-height: 18px;   /* + 2px border = the 22 px target */
+}}
+QPushButton[role="info"]:hover {{ background: {c['surface_hover']}; }}
+QPushButton[role="info"]:focus {{ border: 2px solid {c['accent']}; padding: 0; }}
+
 QPushButton[role="nav"] {{
     background: transparent; border: 1px solid transparent; color: {c['text_secondary']};
     text-align: left; padding: 8px 12px;
@@ -134,6 +142,15 @@ QPushButton[role="nav"]:hover {{ background: {c['nav_hover']}; color: {c['text']
 QPushButton[role="nav"]:checked {{ background: {c['nav_selected']}; color: {c['text']}; font-weight: 600; }}
 QPushButton[role="nav"]:focus {{ border: 2px solid {c['accent']}; padding: 7px 11px; }}
 
+QPushButton[role="segment"] {{
+  background: {c['surface']}; color: {c['text_secondary']}; border: 1px solid {c['border']};
+  padding: 8px 16px; min-height: 20px;
+}}
+QPushButton[role="segment"][position="left"] {{ border-top-left-radius: 8px; border-bottom-left-radius: 8px; }}
+QPushButton[role="segment"][position="right"] {{ border-top-right-radius: 8px; border-bottom-right-radius: 8px; border-left: none; }}
+QPushButton[role="segment"]:hover {{ background: {c['surface_hover']}; color: {c['text']}; }}
+QPushButton[role="segment"]:checked {{ background: {c['surface_hover']}; color: {c['text']}; font-weight: 600; }}
+QPushButton[role="segment"]:focus {{ border: 2px solid {c['accent']}; padding: 7px 15px; }}
 QPushButton[role="chip"] {{
     border: 1px solid {c['border_control']}; border-radius: 15px; padding: 4px 12px; min-height: 20px;
     background: transparent; color: {c['text_secondary']};
@@ -158,6 +175,11 @@ QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
     border: 2px solid {c['accent']}; padding: 6px 9px;
 }}
 QPlainTextEdit:focus, QTextEdit:focus {{ border: 2px solid {c['accent']}; padding: 7px 9px; }}
+/* numeric fields without arrow buttons (role "numeric"): the field's own padding carries the height, so the
+   inner line edit must not add a second border and padding; keyboard arrows and typing are unchanged */
+QAbstractSpinBox[role="numeric"] {{ min-height: 20px; max-height: 20px; }}
+QAbstractSpinBox[role="numeric"]::up-button, QAbstractSpinBox[role="numeric"]::down-button {{ width: 0; border: none; }}
+QAbstractSpinBox[role="numeric"] QLineEdit {{ background: transparent; border: none; padding: 0; min-height: 0; }}
 QPlainTextEdit[role="reader"], QTextEdit[role="reader"] {{
     background: transparent; border: none; border-left: 2px solid {c['border']}; border-radius: 0;
     padding: 2px 8px 2px 12px; color: {c['text']};
@@ -289,6 +311,24 @@ def set_role(widget, role):
     style = widget.style()
     style.unpolish(widget)
     style.polish(widget)
+
+
+def style_numeric(spin, width=110, name=None):
+    """The shared look for numeric fields: same height, border and radius as the other fields, no stepper
+    buttons drawn. Range, step, default, typing, Up/Down keys and the wheel are untouched. `width` is a fixed
+    pixel width, "fit" (the widest value the field can hold plus its padding, for crowded rows) or None
+    (the layout decides)."""
+    set_role(spin, "numeric")
+    spin.lineEdit().setTextMargins(10, 0, 0, 0)   # the editor ignores the field padding when the stepper is zero-width
+    if width == "fit":
+        widest = max((spin.textFromValue(v) for v in (spin.minimum(), spin.maximum())), key=len)
+        text = spin.prefix() + widest + spin.suffix()
+        spin.setFixedWidth(max(64, spin.fontMetrics().horizontalAdvance(text) + 10 + 14))
+    elif width:
+        spin.setFixedWidth(width)
+    if name:
+        spin.setAccessibleName(name)
+    return spin
 
 
 def apply_theme(app):

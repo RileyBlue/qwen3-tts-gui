@@ -78,11 +78,74 @@ def normalize_wavs(wavs):
         return [wavs]
 
 
-def load_wav(path):
-    """Load a WAV file into (numpy array, sample rate) using only the standard library.
+class AudioReadError(ValueError):
+    """The file can't be decoded on this machine. The message is written for the user."""
 
-    Handles 8-bit, 16-bit, and 32-bit PCM WAV; multi-channel is downmixed to mono.
+
+# soundfile format name -> file extensions the app offers for it
+_SOUNDFILE_EXTENSIONS = {"WAV": (".wav",), "FLAC": (".flac",), "MP3": (".mp3",), "OGG": (".ogg",)}
+
+
+def supported_audio_extensions():
+    """Extensions this machine can really decode, so the file pickers never offer a format that will fail.
+    The model reads reference audio through librosa, which here decodes with soundfile (libsndfile) alone: WAV, FLAC,
+    MP3 and OGG. M4A is therefore never offered; adding it would mean a system decoder dependency."""
+    try:
+        import soundfile
+        formats = set(soundfile.available_formats())
+    except Exception:
+        return [".wav"]
+    return [e for name, group in _SOUNDFILE_EXTENSIONS.items() if name in formats for e in group] or [".wav"]
+
+
+def audio_file_filter():
+    """Qt file-dialog filter for the formats in supported_audio_extensions()."""
+    return "Audio (" + " ".join("*" + e for e in supported_audio_extensions()) + ")"
+
+
+def audio_problem(path):
+    """None when `path` looks decodable, else a short actionable sentence. Reads only the header, so it is cheap.
+    When soundfile is unavailable nothing can be judged and None is returned (the decoder itself will report)."""
+    try:
+        import soundfile
+    except Exception:
+        return None
+    try:
+        soundfile.info(path)
+        return None
+    except Exception:
+        pass
+    ext = os.path.splitext(path)[1].lower()
+    names = ", ".join(e[1:].upper() for e in supported_audio_extensions())
+    if ext and ext not in supported_audio_extensions():
+        return f"{ext[1:].upper()} recordings can't be read on this computer. Choose a recording in one of these formats: {names}."
+    return f"This recording couldn't be read. It may be empty or damaged. Choose another file ({names})."
+
+
+def load_wav(path):
+    """Load an audio file into (numpy array, sample rate); multi-channel is downmixed to the first channel.
+
+    The standard-library reader handles 8/16/32-bit integer PCM WAV, as always. Anything it can't read (float or
+    24-bit WAV, FLAC, MP3, OGG) goes through soundfile, the same decoder family the model itself uses. If neither
+    can read the file an AudioReadError explains what to do.
     """
+    import wave
+
+    try:
+        return _load_pcm_wav(path)
+    except (wave.Error, EOFError, ValueError):
+        pass
+    try:
+        import soundfile
+        data, sr = soundfile.read(path, dtype="float32", always_2d=True)
+    except Exception as exc:
+        raise AudioReadError(audio_problem(path) or "This recording couldn't be read.") from exc
+    if data.shape[0] == 0:
+        raise AudioReadError("This recording is empty. Choose another file.")
+    return np.ascontiguousarray(data[:, 0]), int(sr)
+
+
+def _load_pcm_wav(path):
     import wave
 
     with wave.open(path, "rb") as w:

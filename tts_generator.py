@@ -302,6 +302,7 @@ class TTSGenerator:
         # Lower sampling temperature keeps timbre steadier across long text.
         gen_kwargs = dict(temperature=temperature, subtalker_temperature=temperature)
         out, sr = [], None
+        self.clone_chunks = len(jobs)   # bookkeeping for the UI: fewer chunks returned than this means a real early stop
         for i, (emotion, t) in enumerate(jobs):
             if self.should_stop():
                 break

@@ -21,6 +21,8 @@ from typing import Optional
 
 UNKNOWN_SUMMARY = "Something went wrong while creating the sample."
 UNKNOWN_ACTION = "Your description is unchanged. You can try again, or open Show details to see what happened."
+UNKNOWN_SUMMARY_AUDIO = "Something went wrong while generating the audio."
+UNKNOWN_ACTION_AUDIO = "Your text and settings are unchanged. You can try again, or open Show details to see what happened."
 
 
 @dataclass(frozen=True)
@@ -63,7 +65,7 @@ _NETWORK_TYPES = ("ConnectionError", "ConnectTimeout", "ReadTimeout", "Timeout",
                   "LocalEntryNotFoundError", "ConnectError", "NameResolutionError", "MaxRetryError")
 
 
-def classify(failure):
+def classify(failure, noun="sample"):
     """Return an Explanation for a reliably identifiable cause, else None (unknown)."""
     kind, text = failure.short_type, failure.message
     lowered = text.lower()
@@ -80,7 +82,7 @@ def classify(failure):
                 "a required package is missing", False)
     if kind in ("OutOfMemoryError", "MemoryError") or "out of memory" in lowered:
         return Explanation(
-            "memory", "There isn't enough memory to create the sample.",
+            "memory", f"There isn't enough memory to create the {noun}.",
             "Closing other apps may free some memory. Then try again.", "not enough memory", False)
     if failure.errno == _errno.ENOSPC:
         return Explanation(
