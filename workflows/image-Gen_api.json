@@ -1,0 +1,287 @@
+{
+  "14": {
+    "inputs": {
+      "images": [
+        "39:38",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
+    }
+  },
+  "20:1": {
+    "inputs": {
+      "ckpt_name": "Illustrious/illvILoveLucidVisuals_illv10ULTRA.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "20:2": {
+    "inputs": {
+      "stop_at_clip_layer": -2,
+      "clip": [
+        "20:1",
+        1
+      ]
+    },
+    "class_type": "CLIPSetLastLayer",
+    "_meta": {
+      "title": "CLIP Set Last Layer"
+    }
+  },
+  "20:3": {
+    "inputs": {
+      "text": "masterpiece, best quality, newest, absurdres, very aesthetic, high resolution, vibrant colors, crisp cel shading, flat color palette, clean lineart, full body, single character,\n\nfemale, Short curly hair dyed pastel pink, oversized yellow graphic hoodie, bike shorts, mismatched socks, bright energetic eyes",
+      "clip": [
+        "20:13",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "20:4": {
+    "inputs": {
+      "text": "worst quality, low quality, lowres, blurry, jpeg artifacts, bad anatomy, malformed anatomy, deformed, disfigured, bad hands, malformed hands, extra fingers, missing fingers, fused fingers, extra arms, extra legs, extra digits, duplicate, multiple people, cropped, out of frame, text, logo, watermark, signature, photorealistic, 3d, gradient shading",
+      "clip": [
+        "20:13",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "20:5": {
+    "inputs": {
+      "seed": 17,
+      "steps": 15,
+      "cfg": 2.5,
+      "sampler_name": "deis",
+      "scheduler": "beta",
+      "denoise": 1,
+      "model": [
+        "20:13",
+        0
+      ],
+      "positive": [
+        "20:3",
+        0
+      ],
+      "negative": [
+        "20:4",
+        0
+      ],
+      "latent_image": [
+        "20:6",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "20:6": {
+    "inputs": {
+      "width": 512,
+      "height": 768,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "Empty Latent Image"
+    }
+  },
+  "20:7": {
+    "inputs": {
+      "samples": [
+        "20:5",
+        0
+      ],
+      "vae": [
+        "20:1",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "20:9": {
+    "inputs": {
+      "lora_name": "Illustrious/styles/Fabulosity_Style-000010.safetensors",
+      "strength_model": 0.2,
+      "strength_clip": 0.2,
+      "model": [
+        "20:1",
+        0
+      ],
+      "clip": [
+        "20:2",
+        0
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA (Model and CLIP)"
+    }
+  },
+  "20:10": {
+    "inputs": {
+      "lora_name": "Illustrious/styles/Speedoru_Style.safetensors",
+      "strength_model": 0.2,
+      "strength_clip": 0.2,
+      "model": [
+        "20:9",
+        0
+      ],
+      "clip": [
+        "20:9",
+        1
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA (Model and CLIP)"
+    }
+  },
+  "20:11": {
+    "inputs": {
+      "lora_name": "Illustrious/styles/illustrious_flat_color_v2.safetensors",
+      "strength_model": 0.5,
+      "strength_clip": 0.5,
+      "model": [
+        "20:10",
+        0
+      ],
+      "clip": [
+        "20:10",
+        1
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA (Model and CLIP)"
+    }
+  },
+  "20:12": {
+    "inputs": {
+      "lora_name": "Illustrious/styles/WakfuStyle_IXL.safetensors",
+      "strength_model": 0.2,
+      "strength_clip": 0.2,
+      "model": [
+        "20:11",
+        0
+      ],
+      "clip": [
+        "20:11",
+        1
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA (Model and CLIP)"
+    }
+  },
+  "20:13": {
+    "inputs": {
+      "lora_name": "Illustrious/styles/DiivesIXL.safetensors",
+      "strength_model": 0.2,
+      "strength_clip": 0.2,
+      "model": [
+        "20:12",
+        0
+      ],
+      "clip": [
+        "20:12",
+        1
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA (Model and CLIP)"
+    }
+  },
+  "39:38": {
+    "inputs": {
+      "guide_size": 512,
+      "guide_size_for": true,
+      "max_size": 1024,
+      "seed": 993323391985320,
+      "steps": 20,
+      "cfg": 8,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 0.5,
+      "feather": 5,
+      "noise_mask": true,
+      "force_inpaint": true,
+      "bbox_threshold": 0.5,
+      "bbox_dilation": 10,
+      "bbox_crop_factor": 3,
+      "sam_detection_hint": "center-1",
+      "sam_dilation": 0,
+      "sam_threshold": 0.93,
+      "sam_bbox_expansion": 0,
+      "sam_mask_hint_threshold": 0.7,
+      "sam_mask_hint_use_negative": "False",
+      "drop_size": 10,
+      "wildcard": "",
+      "cycle": 1,
+      "inpaint_model": false,
+      "noise_mask_feather": 20,
+      "tiled_encode": false,
+      "tiled_decode": false,
+      "image": [
+        "20:7",
+        0
+      ],
+      "model": [
+        "20:13",
+        0
+      ],
+      "clip": [
+        "20:13",
+        1
+      ],
+      "vae": [
+        "20:1",
+        2
+      ],
+      "positive": [
+        "20:3",
+        0
+      ],
+      "negative": [
+        "20:4",
+        0
+      ],
+      "bbox_detector": [
+        "39:19",
+        0
+      ]
+    },
+    "class_type": "FaceDetailer",
+    "_meta": {
+      "title": "FaceDetailer"
+    }
+  },
+  "39:19": {
+    "inputs": {
+      "model_name": "bbox/face_yolov8n.pt"
+    },
+    "class_type": "UltralyticsDetectorProvider",
+    "_meta": {
+      "title": "UltralyticsDetectorProvider"
+    }
+  }
+}

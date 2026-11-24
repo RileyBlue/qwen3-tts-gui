@@ -5,6 +5,11 @@
 output/
 voices/
 
+# Drama Studio projects and character references
+projects/
+references/
+drama_settings.json
+
 # Python
 __pycache__/
 *.pyc

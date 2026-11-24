@@ -74,6 +74,121 @@ conda activate qwen3-tts
 python launch.py
 ```
 
+## HTTP API
+
+The GUI automatically starts a local HTTP API at `http://127.0.0.1:8765`. It uses
+the same lazily loaded models and saved voice library as the GUI, so model weights
+are not loaded twice. Use `python launch.py --no-api` to disable it, or change the
+address with `--host` and `--port`.
+
+To run without the GUI (and without importing PySide6):
+
+```bash
+python launch.py --api-only
+# Custom model settings are optional:
+python launch.py --api-only --host 127.0.0.1 --port 8765 --device cuda --dtype bfloat16 --attn flash_attention_2
+```
+
+Available endpoints:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/docs` | Interactive Swagger UI |
+| `GET` | `/openapi.json` | OpenAPI 3.0 specification |
+| `POST` | `/mcp` | Model Context Protocol endpoint for compatible harnesses |
+| `GET` | `/health` | Server status and whether generation is busy |
+| `GET` | `/v1/voices` | Saved voices and their metadata |
+| `GET` | `/v1/config` | Languages and generation defaults |
+| `POST` | `/v1/tts/design` | Generate a sample from a voice description |
+| `POST` | `/v1/tts/clone` | Generate speech with a saved voice or reference audio |
+
+Generation endpoints accept JSON and return a WAV file directly. They also save
+the WAV under `output/`; `X-Output-Path`, `X-Sample-Rate`, and `X-Seed` response
+headers provide its metadata.
+
+```bash
+# Design a voice (text is optional; the standard audition text is the default).
+curl -o designed.wav http://127.0.0.1:8765/v1/tts/design \
+  -H 'Content-Type: application/json' \
+  -d '{"description":"A warm, calm female narrator","text":"Hello from the API.","language":"english","seed":42}'
+
+# Clone a saved voice. Use GET /v1/voices to find available names.
+curl -o cloned.wav http://127.0.0.1:8765/v1/tts/clone \
+  -H 'Content-Type: application/json' \
+  -d '{"voice":"Narrator","text":"A longer passage to speak.","language":"english","seed":42,"temperature":0.7}'
+```
+
+Clone requests also accept `min_words`, `max_words`, `ref_audio`, `ref_text`,
+`x_vector_only`, `reuse_prompt`, `save_prompt`, and `description`. Supply either
+`voice`, `ref_audio`, or `reuse_prompt`. The API processes one generation at a
+time and returns HTTP 409 while the GUI or another API request is busy.
+
+Python scripts can use the standard library without an API client dependency:
+
+```python
+import json, urllib.request
+payload = json.dumps({"voice": "Narrator", "text": "Hello from Python."}).encode()
+request = urllib.request.Request("http://127.0.0.1:8765/v1/tts/clone", data=payload,
+                                 headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(request) as response, open("speech.wav", "wb") as output:
+    output.write(response.read())
+```
+
+## Swagger and MCP
+
+Open `http://127.0.0.1:8765/docs` for interactive Swagger documentation, or use
+`http://127.0.0.1:8765/openapi.json` with another OpenAPI client. Swagger UI loads
+its browser assets from jsDelivr, so displaying the page requires internet access;
+the OpenAPI JSON and API itself remain local.
+
+Harnesses supporting streamable HTTP MCP can connect directly to
+`http://127.0.0.1:8765/mcp`. A typical MCP configuration is:
+
+```json
+{
+  "mcpServers": {
+    "qwen3-tts": {
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+The endpoint implements `initialize`, `ping`, `tools/list`, and `tools/call` using
+MCP protocol version `2025-03-26`. It exposes `list_voices`, `get_config`,
+`voice_design`, and `voice_clone`. Generation tools return base64-encoded
+`audio/wav` content plus text metadata containing the output path, sample rate,
+and seed. The server is stateless and does not create MCP sessions or open a
+server-initiated event stream.
+
+The API has no authentication and is intended for trusted local scripts and
+harnesses. Do not bind it to a non-loopback address unless you protect it with
+appropriate network controls.
+
+## Drama Studio (ComfyUI + LLM)
+
+The **Drama Studio** tab integrates `minimax_drama.py` with local or remote
+ComfyUI image/video workflows (`workflows/image-Gen_api.json` and
+`workflows/video_minimax_h3_r2v_api.json`).
+
+1. **Settings (LLM & ComfyUI)**: Open **Settings** and configure the LLM
+   provider (`OpenRouter`, `OpenAI`, or `Custom / local`), base URL, model,
+   session API key (or `OPENROUTER_API_KEY` / `OPENAI_API_KEY`), and ComfyUI URL
+   (`http://127.0.0.1:8188` or a remote server). Saved settings exclude the API
+   key.
+2. **Project**: Select an existing project or create a new one at the top of
+   Drama Studio before managing its cast or script; project assets live under
+   `projects/<project>/`.
+3. **Cast**: Create or edit project characters in
+   `projects/<project>/references/characters.json`, assign and preview a saved
+   Qwen voice, and attach a reference image (or tags for ComfyUI reference
+   generation).
+4. **Script & Render**: Paste prose or a story prompt with verbatim dialogue,
+   generate and review the segment plan JSON, generate any missing reference
+   images into `projects/<project>/references/`, and render/concatenate the
+   final vertical video under `projects/<project>/`. Final stitching requires
+   `ffmpeg` and `ffprobe` on `PATH`.
+
 ## Project commands
 
 | Command | Description |

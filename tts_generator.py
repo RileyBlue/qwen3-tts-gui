@@ -7,6 +7,7 @@ Two ways to get one consistent voice:
   * VoiceDesign  - used to create voices (and emotion references), not for long-form.
 """
 
+import functools
 import inspect
 import json
 import os
@@ -28,6 +29,18 @@ def _first(wavs):
 
 class StopRequested(Exception):
     pass
+
+
+def _serialized(method):
+    """Use the shared model lock when GUI and API run in the same process."""
+    @functools.wraps(method)
+    def locked(self, *args, **kwargs):
+        lock = getattr(self.models, "generation_lock", None)
+        if lock is None:
+            return method(self, *args, **kwargs)
+        with lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class TTSGenerator:
@@ -52,6 +65,7 @@ class TTSGenerator:
         return jobs
 
     # ---- VoiceDesign: voice creation
+    @_serialized
     def design_sample(self, description, language, seed, text=None):
         """`text` is what the voice says; None keeps the standard audition passage."""
         model = self.models.get("voice-design", self.notify)
@@ -61,6 +75,7 @@ class TTSGenerator:
         )
         return _first(wavs), sr
 
+    @_serialized
     def build_voice_prompt(self, wav, sr, text=None):
         """`text` must be the words spoken in `wav` (the clone prompt aligns the audio to them)."""
         base = self.models.get("voice-clone", self.notify)
@@ -68,6 +83,7 @@ class TTSGenerator:
             ref_audio=(wav, sr), ref_text=text or voice_library.SAMPLE_TEXT, x_vector_only_mode=False
         )
 
+    @_serialized
     def build_clone_prompt(self, ref_audio, ref_text, x_vector_only=False):
         """Build a voice-clone prompt from reference audio without generating audio."""
         model = self.models.get("voice-clone", self.notify)
@@ -75,6 +91,7 @@ class TTSGenerator:
             ref_audio=ref_audio, ref_text=ref_text or None, x_vector_only_mode=x_vector_only
         )
 
+    @_serialized
     def xtts(self, text, language, seed, temperature, voice_name):
         language_code = XTTS_LANGUAGES.get(language.lower())
         if not language_code:
@@ -108,6 +125,7 @@ class TTSGenerator:
             return [], None
         return wavs, model.synthesizer.output_sample_rate
 
+    @_serialized
     def csm(self, text, language, seed, temperature, voice_name):
         if language.lower() != "english":
             raise ValueError("CSM supports English only; select English for this segment.")
@@ -165,6 +183,7 @@ class TTSGenerator:
             return [], None
         return wavs, 24000
 
+    @_serialized
     def dia(self, text, language, seed, temperature, voice_name):
         if language.lower() != "english":
             raise ValueError("Dia supports English only; select English for this segment.")
@@ -214,6 +233,7 @@ class TTSGenerator:
             return [], None
         return wavs, 24000
 
+    @_serialized
     def f5(self, text, language, seed, temperature, voice_name):
         if language.lower() not in ("english", "chinese"):
             raise ValueError("F5-TTS supports English and Chinese; select a supported language.")
@@ -256,6 +276,7 @@ class TTSGenerator:
         return wavs, output_rate
 
     # ---- VoiceClone
+    @_serialized
     def clone(self, text, language, min_words, max_words, seed=None, temperature=0.7,
               voice_name=None, ref_audio="", ref_text=None, x_vector_only=False,
               reuse_prompt=None, save_prompt=None, description=""):

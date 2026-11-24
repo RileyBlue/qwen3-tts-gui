@@ -67,6 +67,8 @@ class ModelManager:
         self._models = OrderedDict()
         self._loaded_with = None
         self._lock = threading.Lock()
+        # TTSGenerator uses this to prevent GUI and API generation from sharing a model concurrently.
+        self.generation_lock = threading.RLock()
 
     def get(self, kind, notify=None):
         from config import CSM_MODEL, DIA_MODEL, MODEL_MAP, XTTS_MODEL

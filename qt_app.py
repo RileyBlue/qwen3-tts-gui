@@ -29,7 +29,10 @@ from config import (
     DEFAULT_MIN_WORDS, ATTNS, DTYPES, LANGUAGES, MODELS, MODEL_MAP, OUTPUT_DIR,
 )
 from model_loader import ModelManager
+from drama_studio import (PROVIDERS as DRAMA_PROVIDERS, environment_key as drama_env_key,
+                          load_settings as load_drama_settings, save_settings as save_drama_settings)
 from qt_audiobook import AudiobookTab
+from qt_drama import DramaTab
 from theme import COLORS, SIDEBAR_WIDTH, apply_theme, set_role, style_numeric
 from tts_generator import TTSGenerator
 from voice_lock import EMOTION_PRESETS, parse_emotion_segments
@@ -71,7 +74,7 @@ PAGE_CREATE = 0
 # Starts a Create Voice generation. Qt maps Ctrl to Command on macOS, so show the native spelling.
 # Lucide icon for each sidebar entry; the text label always stays next to it.
 NAV_ICONS = {"Create Voice": "wand-sparkles", "Clone Voice": "copy", "My Voices": "mic-vocal",
-             "Audiobooks": "book-open", "Settings": "settings"}
+             "Audiobooks": "book-open", "Drama Studio": "play", "Settings": "settings"}
 GENERATE_SHORTCUT = "Ctrl+Return"
 READY_STATUS = "Sample ready. Listen, then name and save the voice if you like it."
 STOP_AUDIO_TIP = "Stop the audio that is playing"
@@ -715,9 +718,19 @@ class MainWindow(QtWidgets.QMainWindow):
         ab_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         ab_scroll.setWidget(self.audiobook_tab)
         self.stack.addWidget(ab_scroll)
+        self.drama_tab = DramaTab(self)
+        self.drama_tab.setProperty("density", "compact")
+        drama_lay = self.drama_tab.layout()
+        drama_lay.setContentsMargins(24, 24, 24, 16)
+        drama_lay.insertWidget(0, page_header("Drama Studio", "Cast management, LLM script planning, and ComfyUI video rendering."))
+        drama_scroll = QtWidgets.QScrollArea()
+        drama_scroll.setWidgetResizable(True)
+        drama_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        drama_scroll.setWidget(self.drama_tab)
+        self.stack.addWidget(drama_scroll)
         self.stack.addWidget(settings_page)
 
-        shell.addWidget(self._build_sidebar(("Create Voice", "Clone Voice", "My Voices", "Audiobooks"), "Settings"))
+        shell.addWidget(self._build_sidebar(("Create Voice", "Clone Voice", "My Voices", "Audiobooks", "Drama Studio"), "Settings"))
         main_col = QtWidgets.QVBoxLayout()
         main_col.setContentsMargins(0, 0, 0, 0)
         main_col.setSpacing(0)
@@ -851,7 +864,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         Task options (language, seed, auto-save, naming) stay on the screen that uses them.
         """
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         page = QtWidgets.QWidget()
+        scroll.setWidget(page)
         outer = QtWidgets.QVBoxLayout(page)
         outer.setContentsMargins(32, 32, 32, 24)
         outer.setSpacing(16)
@@ -895,6 +912,28 @@ class MainWindow(QtWidgets.QMainWindow):
         section("Long-form text", "Used by Clone Voice and Audiobooks. Voice creation is not split into chunks.",
                 (("Min words per chunk", self.spn_min), ("Max words per chunk", self.spn_max)))
         outer.addSpacing(8)
+        self._drama_settings = load_drama_settings()
+        self.cmb_drama_provider = combo(list(DRAMA_PROVIDERS), self._drama_settings["provider"])
+        self.edt_drama_llm_url = QtWidgets.QLineEdit(self._drama_settings["llm_base_url"])
+        self.edt_drama_llm_url.setMinimumWidth(340)
+        self.edt_drama_llm_model = QtWidgets.QLineEdit(self._drama_settings["llm_model"])
+        self.edt_drama_llm_model.setMinimumWidth(340)
+        self.edt_drama_api_key = QtWidgets.QLineEdit(drama_env_key(self.cmb_drama_provider.currentText()))
+        self.edt_drama_api_key.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.edt_drama_api_key.setMinimumWidth(340)
+        self.edt_drama_comfy = QtWidgets.QLineEdit(self._drama_settings["comfy_url"])
+        self.edt_drama_comfy.setMinimumWidth(340)
+        self.cmb_drama_provider.currentTextChanged.connect(self._drama_provider_changed)
+        self.btn_drama_save_conn = QtWidgets.QPushButton("Save connection settings")
+        self.btn_drama_save_conn.clicked.connect(self._save_drama_connection)
+        section("Drama Studio (LLM & ComfyUI)",
+                "API keys are kept in memory for this session only and are never saved to disk. "
+                "OPENROUTER_API_KEY or OPENAI_API_KEY load automatically when set. ComfyUI may be local or remote.",
+                (("LLM provider", self.cmb_drama_provider), ("OpenAI-compatible URL", self.edt_drama_llm_url),
+                 ("LLM model", self.edt_drama_llm_model), ("API key", self.edt_drama_api_key),
+                 ("ComfyUI URL", self.edt_drama_comfy)))
+        outer.addWidget(self.btn_drama_save_conn, 0, QtCore.Qt.AlignLeft)
+        outer.addSpacing(8)
         note = QtWidgets.QLabel(
             "Defaults are unchanged from earlier versions. flash_attention_2 targets NVIDIA GPUs with the "
             "flash-attn package installed; behavior on other hardware has not been verified here. "
@@ -904,7 +943,28 @@ class MainWindow(QtWidgets.QMainWindow):
         set_role(note, "muted")
         outer.addWidget(note)
         outer.addStretch(1)
-        return page
+        return scroll
+
+    def _drama_provider_changed(self, provider):
+        url, model, _ = DRAMA_PROVIDERS[provider]
+        self.edt_drama_llm_url.setText(url)
+        self.edt_drama_llm_model.setText(model)
+        self.edt_drama_api_key.setText(drama_env_key(provider))
+
+    def drama_connection_settings(self):
+        return {
+            "provider": self.cmb_drama_provider.currentText(),
+            "llm_base_url": self.edt_drama_llm_url.text().strip(),
+            "llm_model": self.edt_drama_llm_model.text().strip(),
+            "comfy_url": self.edt_drama_comfy.text().strip(),
+        }
+
+    def drama_api_key(self):
+        return self.edt_drama_api_key.text().strip()
+
+    def _save_drama_connection(self):
+        self._drama_settings = save_drama_settings(self.drama_connection_settings())
+        self.status("Drama connection settings saved; the API key was not written to disk.")
 
     def _build_footer(self):
         """Global status strip: progress, last message, and audio/output shortcuts."""
@@ -1968,6 +2028,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_voice_desc()
         if hasattr(self, "audiobook_tab"):
             self.audiobook_tab.refresh_voices()
+        if hasattr(self, "drama_tab"):
+            self.drama_tab.refresh_voices()
 
     # ------------------------------------------------------------------ VoiceClone
     # Exactly one voice source is active at a time; only it is sent to generation.
@@ -3102,7 +3164,8 @@ class MainWindow(QtWidgets.QMainWindow):
     @property
     def action_buttons(self):
         return (self.btn_vd_generate, self.btn_vd_save, self.btn_vd_regenerate, self.btn_vd_retry,
-                self.btn_vc_generate, self.audiobook_tab.btn_render, self.audiobook_tab.btn_preview)
+                self.btn_vc_generate, self.audiobook_tab.btn_render, self.audiobook_tab.btn_preview,
+                *self.drama_tab.action_buttons)
 
 
 # ------------------------------------------------------------------ Voice Manager dialog
@@ -3211,11 +3274,22 @@ def configure_keyboard_navigation(app):
     app.styleHints().setTabFocusBehavior(QtCore.Qt.TabFocusAllControls)
 
 
-def main():
+def main(api_enabled=True, api_host="127.0.0.1", api_port=8765):
     app = QtWidgets.QApplication(sys.argv)
     configure_keyboard_navigation(app)
     apply_theme(app)
     win = MainWindow()
+    if api_enabled:
+        from api_server import APIService, QwenAPIServer
+        try:
+            service = APIService(win.models, gui_busy=lambda: win.busy)
+            api_server = QwenAPIServer(api_host, api_port, service)
+            api_server.start()
+        except OSError as exc:
+            print(f"Could not start the API on {api_host}:{api_port}: {exc}. GUI will continue.")
+        else:
+            print(f"Qwen3-TTS API listening on {api_server.address}", flush=True)
+            app.aboutToQuit.connect(api_server.stop)
     win.show()
     sys.exit(app.exec())
 
