@@ -23,6 +23,7 @@ from PySide6.QtTest import QTest
 import audio_player
 from audio_utils import load_wav, write_wav
 import qt_app
+import cast_rules
 import qt_audiobook
 import icons
 import theme
@@ -1704,7 +1705,10 @@ class _AbVoices:
             path = voice_library.voice_dir(name)
             os.makedirs(path)
             with open(os.path.join(path, "voice.json"), "w") as f:
-                json.dump({"name": name, "description": "d", "language": "english", "seed": 1, "created": "x"}, f)
+                json.dump({"name": name, "description": "d", "language": "english", "seed": 1, "created": "x",
+                           "ref_audio": "reference.wav", "clone_prompt": "clone_prompt.npz", "csm_ref_text": "Hello there."}, f)
+            write_wav(os.path.join(path, "reference.wav"), np.zeros(24000), 24000)   # the files the engines read
+            np.savez(os.path.join(path, "clone_prompt.npz"), x=np.zeros(1))
         return self
 
     def __exit__(self, *exc):
@@ -1752,7 +1756,7 @@ def _test_audiobook_list_refills_and_selection_never_change_segments():
         # a voice that disappeared stays visible and unchanged
         tab.segments[2]["voice"] = "voice:Gone"
         tab.rebuild(select=2)
-        assert tab.cmb_seg_voice.currentText() == "Missing: voice:Gone" and tab.segments[2]["voice"] == "voice:Gone"
+        assert tab.cmb_seg_voice.currentText() == "Missing: Gone" and tab.segments[2]["voice"] == "voice:Gone"
         tab.refresh_voices()
         assert tab.segments[2]["voice"] == "voice:Gone"
         win.close()
@@ -1785,7 +1789,7 @@ def _test_audiobook_editor_applies_voice_to_the_selection_and_keeps_direction_pe
         assert not tab.txt_segment.isEnabled() and not tab.cmb_seg_direction.isEnabled()
         assert tab.cmb_seg_voice.currentIndex() == -1, "mixed voices must not show (or write) a value"
         assert tab.segments[0]["voice"] == "voice:Ana" and tab.segments[1]["voice"] == "voice:Marcus"
-        idx = tab.cmb_seg_voice.findData("voice:Marcus")
+        idx = tab.cmb_seg_voice.findData("Marcus")
         tab.cmb_seg_voice.setCurrentIndex(idx)          # what the user's pick does, then the activated signal
         tab.cmb_seg_voice.activated.emit(idx)
         assert [tab.segments[i]["voice"] for i in (0, 1, 3)] == ["voice:Marcus"] * 3
@@ -1912,14 +1916,14 @@ def _test_audiobook_rows_are_compact_readable_and_accessible():
             # State_HasFocus draws the accent focus frame by design
         # the accessible text reads number, role, voice, direction and text
         text = tab.listw.item(2).data(QtCore.Qt.AccessibleTextRole)
-        assert text.startswith("Segment 3, narration, voice Qwen: ") and "direction whisper" in text and "Segment number 3." in text, text
+        assert text.startswith("Segment 3, narration, voice Ana, engine Qwen") and "direction whisper" in text and "Segment number 3." in text, text
         assert "[whisper]" in tab.listw.item(2).data(qt_audiobook.DESC_ROLE)
         assert tab.listw.item(1).data(qt_audiobook.ROLE_ROLE) == "D" and tab.listw.item(0).data(qt_audiobook.ROLE_ROLE) == "N"
         tab.segments[4]["voice"] = "voice:Gone"
         tab.rebuild(select=4)
-        assert tab.listw.item(4).data(voice_list.NAME_ROLE) == "Missing: voice:Gone", "a missing voice keeps its full label"
+        assert tab.listw.item(4).data(voice_list.NAME_ROLE) == "Missing: Gone", "a missing voice keeps its full label"
         tip = tab.listw.item(0).toolTip()
-        assert long_name in tip and tip.startswith("Segment 1 · Narration · Qwen: A Very Long"), tip
+        assert long_name in tip and tip.startswith("Segment 1 · Narration · A Very Long"), tip
         # multi-selection, keyboard navigation and Select All still work on the compact rows
         tab.listw.setCurrentRow(2)
         tab.listw.setFocus()
@@ -2000,9 +2004,9 @@ def _test_audiobook_tab_cycle_from_the_navigation_is_pinned_both_ways():
         fixed = lambda labels: ["Segments" if l == "?VoiceList" else l for l in labels]
         forward = fixed(_focus_cycle(win))
         expected = ["Audiobooks", "Open output folder",      # the footer follows the navigation here, as on every page not yet given an explicit order
-                    "Save project…", "Load project…", "Render chapter", "Chapter script", "combo:Qwen: Ana",
-                    "combo:Qwen: Marcus", "combo:english", "Split into segments", "Render settings", "Segments",
-                    "▶ Preview segment", "Selected segment text", "combo:Qwen: Ana", "combo:sad", "Split here",
+                    "Save project…", "Load project…", "Render chapter", "Chapter script", "combo:Ana", "combo:Qwen",
+                    "combo:Marcus", "combo:Qwen", "combo:english", "Split into segments", "Render settings", "Segments",
+                    "▶ Preview segment", "Selected segment text", "combo:Ana", "combo:Qwen", "combo:sad", "Split here",
                     "Merge next", "Add after", "Move up", "Move down", "Delete"]
         assert forward == expected, forward
         backward = fixed(_focus_cycle(win, backwards=True))
@@ -2018,7 +2022,7 @@ def _test_audiobook_keyboard_wheel_and_geometry_at_the_minimum_window():
         counts = []
         for n in (2, 27):
             win, tab = _ab_tab(n)
-            tab.cmb_narrator.setCurrentIndex(tab.cmb_narrator.findData(f"voice:{long_name}"))
+            tab.cmb_narrator.setCurrentIndex(tab.cmb_narrator.findData(long_name))
             tab.segments[0]["voice"] = f"voice:{long_name}"
             tab.rebuild(select=0)
             tab.btn_render.setFocus()
@@ -2035,14 +2039,15 @@ def _test_audiobook_keyboard_wheel_and_geometry_at_the_minimum_window():
                 tab.btn_save.setFocus()
                 _app.processEvents()
                 seen = []
-                for _ in range(19):
+                for _ in range(22):
                     QTest.keyClick(_app.focusWidget(), QtCore.Qt.Key_Tab)
                     _app.processEvents()
                     w = _app.focusWidget()
                     seen.append(tab.cmb_seg_direction if w is tab.cmb_seg_direction.lineEdit() else w)
-                expected = [tab.btn_load, tab.btn_render, tab.txt_source, tab.cmb_narrator, tab.cmb_dialogue, tab.cmb_lang,
+                expected = [tab.btn_load, tab.btn_render, tab.txt_source, tab.cmb_narrator, tab.cmb_narrator_engine,
+                            tab.cmb_dialogue, tab.cmb_dialogue_engine, tab.cmb_lang,
                             tab.btn_split, tab.btn_settings, tab.listw, tab.btn_preview, tab.txt_segment, tab.cmb_seg_voice,
-                            tab.cmb_seg_direction, tab.btn_split_cursor, tab.btn_merge, tab.btn_add, tab.btn_up, tab.btn_down,
+                            tab.cmb_seg_engine, tab.cmb_seg_direction, tab.btn_split_cursor, tab.btn_merge, tab.btn_add, tab.btn_up, tab.btn_down,
                             tab.btn_delete]
                 assert seen == expected, [(w.accessibleName() or w.text()) for w in seen]
             # geometry: nothing is clipped at 1024x640, Render is in view, no scrollbars
@@ -2050,12 +2055,14 @@ def _test_audiobook_keyboard_wheel_and_geometry_at_the_minimum_window():
             assert scroll.horizontalScrollBar().maximum() == 0 and scroll.verticalScrollBar().maximum() == 0
             area = tab.rect()
             for w in (tab.btn_save, tab.btn_load, tab.btn_render, tab.btn_split, tab.cmb_narrator, tab.cmb_dialogue,
+                      tab.cmb_narrator_engine, tab.cmb_dialogue_engine, tab.status_narrator, tab.status_dialogue,
+                      tab.status_segment, tab.cmb_seg_engine,
                       tab.cmb_lang, tab.listw, tab.txt_segment, tab.cmb_seg_voice, tab.cmb_seg_direction,
                       tab.btn_delete, tab.btn_preview):
                 top_left = w.mapTo(tab, QtCore.QPoint(0, 0))
                 box = QtCore.QRect(top_left, w.size())
                 assert area.contains(box), (w.accessibleName() or w.text(), box, area)
-                assert w.width() >= w.minimumSizeHint().width(), (w.accessibleName() or w.text(), w.width())
+                assert w.width() >= (w.minimumWidth() or w.minimumSizeHint().width()), (w.accessibleName() or w.text(), w.width())   # a combo may be squeezed to its set minimum, and elides
             assert tab.btn_render.isVisible()
             # the wheel changes nothing unless the combo has focus
             tab.listw.setCurrentRow(1)
@@ -2084,6 +2091,457 @@ def _test_audiobook_keyboard_wheel_and_geometry_at_the_minimum_window():
             win.close()
         assert counts[0] == counts[1], f"Tab stops must not grow with the number of segments: {counts}"
     print("PASS: Audiobooks: Tab reaches the editor in a few stops at any size of book, nothing clips at 1024x640, the wheel never changes a voice")
+
+
+_READY_ENV = {"xtts": True, "csm": True, "dia": True, "f5": "ok"}
+
+
+class _CastEnv:
+    """Every optional engine importable, so the tests judge the voices, language and text rather than this machine."""
+
+    def __init__(self, **overrides):
+        self.env = dict(_READY_ENV, **overrides)
+
+    def __enter__(self):
+        from unittest.mock import patch
+        self.patch = patch.object(cast_rules, "environment", lambda: dict(self.env))
+        self.patch.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.patch.stop()
+
+
+def _ab_edit_voice(name, **changes):
+    path = os.path.join(voice_library.voice_dir(name), "voice.json")
+    with open(path, encoding="utf-8") as handle:
+        config = json.load(handle)
+    config.update(changes)
+    config = {key: value for key, value in config.items() if value is not None}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(config, handle)
+
+
+def _pick(combo, data):
+    """What the user's choice does: set the item, then the activated signal."""
+    index = combo.findData(data)
+    assert index >= 0, (data, [combo.itemData(i) for i in range(combo.count())])
+    combo.setCurrentIndex(index)
+    combo.activated.emit(index)
+    _app.processEvents()
+
+
+def _engine_items(combo):
+    return {combo.itemData(i): (combo.itemText(i), combo.model().item(i).isEnabled()) for i in range(combo.count())}
+
+
+def _test_cast_voices_appear_once_and_engines_carry_their_state():
+    with _AbVoices("Ana", "Bare"), _CastEnv(xtts=False):
+        _ab_edit_voice("Bare", csm_ref_text=None)
+        win, tab = _ab_tab(4)
+        names = [tab.cmb_narrator.itemData(i) for i in range(tab.cmb_narrator.count())]
+        assert names == ["Ana", "Bare"] and all(tab.cmb_seg_voice.itemData(i) in names for i in range(tab.cmb_seg_voice.count()))
+        assert [tab.cmb_narrator.itemText(i) for i in range(2)] == ["Ana", "Bare"], "no engine-prefixed duplicates"
+        assert [tab.cmb_narrator_engine.itemData(i) for i in range(5)] == ["qwen", "xtts", "csm", "dia", "f5"]
+        # Ana: Qwen ready; XTTS needs the package (here forced missing)
+        engines = _engine_items(tab.cmb_narrator_engine)
+        assert engines["qwen"] == ("Qwen", True) and engines["csm"] == ("CSM", True)
+        assert engines["xtts"][0].startswith("XTTS · needs coqui-tts") and engines["xtts"][1], "needs setup stays selectable"
+        assert "Ready" in tab.status_narrator.full_text() and "local checks only" in tab.status_narrator.full_text()
+        # Bare has no confirmed transcript: CSM, Dia and F5 need setup, with an actionable reason
+        _pick(tab.cmb_narrator, "Bare")
+        assert _engine_items(tab.cmb_narrator_engine)["csm"][0] == "CSM · needs transcript"
+        _pick(tab.cmb_narrator_engine, "csm")
+        assert tab.narrator_key() == "csm:Bare"
+        text = tab.status_narrator.full_text()
+        assert text.startswith("Needs setup:") and "Reference transcript" in text and tab.status_narrator.state == cast_rules.SETUP
+        assert "Reference transcript" in tab.cmb_narrator.accessibleDescription()
+        # a narrator split uses voice and engine together
+        tab.txt_source.setPlainText('He said, "Hello." Then left.')
+        tab.segments = []
+        tab.auto_split()
+        assert [s["voice"] for s in tab.segments][0] == "csm:Bare"
+        win.close()
+    print("PASS: Cast: each voice appears once, engines carry their state, Needs setup stays selectable with an actionable reason")
+
+
+def _test_cast_language_makes_engines_unavailable_but_never_rewrites_assignments():
+    with _AbVoices("Ana", "Marcus"), _CastEnv():
+        win, tab = _ab_tab(4)
+        tab.segments[1]["voice"] = "csm:Marcus"
+        tab.segments[3]["voice"] = "xtts:Ana"
+        tab.rebuild(select=0)
+        before = [s["voice"] for s in tab.segments]
+        tab.cmb_lang.setCurrentText("french")
+        _app.processEvents()
+        engines = _engine_items(tab.cmb_seg_engine)
+        assert engines["csm"][1] is False and engines["dia"][1] is False and engines["f5"][1] is False
+        assert engines["csm"][0] == "CSM · English only" and engines["xtts"][1] and engines["qwen"][1]
+        assert "Unavailable:" in tab.cmb_seg_engine.accessibleDescription() and "English only" in tab.cmb_seg_engine.accessibleDescription()
+        assert [s["voice"] for s in tab.segments] == before, "a language change never rewrites a segment"
+        state = qt_audiobook.STATE_ROLE
+        assert tab.listw.item(1).data(state) == cast_rules.UNSUPPORTED and tab.listw.item(0).data(state) == cast_rules.READY
+        assert tab.listw.item(3).data(state) == cast_rules.READY
+        assert "Unsupported" in tab.listw.item(1).data(QtCore.Qt.AccessibleTextRole) and "English only" in tab.listw.item(1).toolTip()
+        # an invalid assignment stays visible and editable: select it, its own engine is still choosable
+        tab.listw.setCurrentRow(1)
+        assert tab.cmb_seg_engine.currentData() == "csm" and _engine_items(tab.cmb_seg_engine)["csm"][1] is True
+        assert tab.status_segment.state == cast_rules.UNSUPPORTED and tab.status_segment.full_text() == "English only"
+        assert "Change Language" in tab.status_segment.toolTip() and "Change Language" in tab.cmb_seg_voice.accessibleDescription()
+        _pick(tab.cmb_seg_voice, "Ana")                       # changing the voice is still allowed
+        assert tab.segments[1]["voice"] == "csm:Ana"
+        # a new, invalid engine cannot be assigned, even by a programmatic activation
+        _pick(tab.cmb_seg_engine, "xtts")
+        assert tab.segments[1]["voice"] == "xtts:Ana"
+        tab.listw.setCurrentRow(0)
+        index = tab.cmb_seg_engine.findData("dia")
+        assert not tab.cmb_seg_engine.model().item(index).isEnabled()
+        tab.cmb_seg_engine.activated.emit(index)
+        _app.processEvents()
+        assert tab.segments[0]["voice"] == "voice:Ana"
+        tab.cmb_lang.setCurrentText("english")
+        assert _engine_items(tab.cmb_seg_engine)["dia"][1] is True
+        win.close()
+    print("PASS: Cast: a language change disables engines that cannot speak it and flags, never rewrites, existing assignments")
+
+
+def _test_cast_direction_and_tags_follow_the_selection_and_block_new_assignments():
+    with _AbVoices("Ana", "Marcus"), _CastEnv():
+        win, tab = _ab_tab(4)
+        tab.listw.setCurrentRow(2)                                # has direction "sad" (Qwen)
+        engines = _engine_items(tab.cmb_seg_engine)
+        assert all(engines[e][1] is False and "no direction" in engines[e][0] for e in ("xtts", "csm", "dia", "f5")), engines
+        assert engines["qwen"][1]
+        tab.cmb_seg_direction.setEditText("")
+        assert all(_engine_items(tab.cmb_seg_engine)[e][1] for e in ("xtts", "csm", "dia", "f5")), "clearing the direction frees them"
+        tab.txt_segment.setPlainText("[sad] It rained.")
+        assert _engine_items(tab.cmb_seg_engine)["csm"][0] == "CSM · no [tags]" and not _engine_items(tab.cmb_seg_engine)["csm"][1]
+        # several selected segments: an engine is disabled if it cannot speak any of them
+        tab.txt_segment.setPlainText("It rained.")
+        _select_rows(tab, 0, 1, 2)
+        tab.segments[2]["direction"] = "whisper"
+        tab._sync_voice_combo()
+        assert not _engine_items(tab.cmb_seg_engine)["csm"][1]
+        win.close()
+    print("PASS: Cast: direction and [tags] disable the engines that cannot speak them, for one segment or for any in a selection")
+
+
+def _test_cast_bulk_edits_keep_each_voice_and_each_engine():
+    with _AbVoices("Ana", "Marcus"), _CastEnv():
+        win, tab = _ab_tab(6)
+        tab.segments[0]["voice"], tab.segments[1]["voice"], tab.segments[3]["voice"] = "xtts:Ana", "csm:Marcus", "voice:Ana"
+        tab.segments[2]["direction"] = ""
+        tab.rebuild(select=0)
+        _select_rows(tab, 0, 1, 3)
+        assert tab.cmb_seg_voice.currentIndex() == -1 and tab.cmb_seg_voice.placeholderText() == "Mixed"
+        assert tab.cmb_seg_engine.currentIndex() == -1 and tab.cmb_seg_engine.placeholderText() == "Keep each"
+        _pick(tab.cmb_seg_voice, "Marcus")                          # the voice changes, each engine stays
+        assert [tab.segments[i]["voice"] for i in (0, 1, 3)] == ["xtts:Marcus", "csm:Marcus", "voice:Marcus"]
+        assert tab.cmb_seg_voice.currentData() == "Marcus" and tab.cmb_seg_engine.currentIndex() == -1
+        _pick(tab.cmb_seg_engine, "dia")                            # the engine changes, each voice stays
+        assert [tab.segments[i]["voice"] for i in (0, 1, 3)] == ["dia:Marcus"] * 3
+        assert tab.cmb_seg_engine.currentData() == "dia"
+        assert tab.segments[2]["voice"] == "voice:Ana" and tab.segments[4]["voice"] == "voice:Ana", "unselected rows untouched"
+        # a bulk choice that would give any segment an impossible combination changes nothing at all
+        tab.segments[1]["direction"] = "whisper"
+        before = [s["voice"] for s in tab.segments]
+        _select_rows(tab, 0, 1)
+        tab.cmb_seg_engine.activated.emit(tab.cmb_seg_engine.findData("xtts"))
+        _app.processEvents()
+        assert [s["voice"] for s in tab.segments] == before and "Not changed" in win.lbl_status.text()
+        # the status line reports how many of the selection need attention
+        tab.segments[1]["voice"] = "csm:Gone"
+        tab.rebuild(select=0)
+        _select_rows(tab, 0, 1, 2)
+        assert "of 3: " in tab.status_segment.full_text() and "selected segments need attention" in tab.cmb_seg_voice.accessibleDescription()
+        win.close()
+    print("PASS: Cast: bulk voice keeps each engine, bulk engine keeps each voice, impossible bulk changes write nothing")
+
+
+def _test_cast_missing_voices_are_preserved_and_flagged():
+    with _AbVoices("Ana", "Marcus"), _CastEnv():
+        win, tab = _ab_tab(4)
+        tab.segments[1]["voice"] = "csm:Gone"
+        tab.segments[2]["voice"] = "legacy-key"
+        tab.segments[3]["voice"] = ""
+        tab.rebuild(select=1)
+        before = [s["voice"] for s in tab.segments]
+        assert tab.cmb_seg_voice.currentText() == "Missing: Gone" and tab.cmb_seg_engine.currentData() == "csm"
+        assert tab.listw.item(1).data(voice_list.NAME_ROLE) == "Missing: Gone"
+        assert tab.listw.item(1).data(qt_audiobook.STATE_ROLE) == cast_rules.MISSING
+        assert "Voice missing" == tab.status_segment.full_text() and "no longer exists" in tab.status_segment.toolTip()
+        assert tab.listw.item(2).data(qt_audiobook.STATE_ROLE) == cast_rules.MISSING and tab.listw.item(3).data(qt_audiobook.STATE_ROLE) == cast_rules.SETUP
+        tab.refresh_voices()
+        tab.refresh_compat()
+        tab.cmb_lang.setCurrentText("german")
+        tab.cmb_lang.setCurrentText("english")
+        assert [s["voice"] for s in tab.segments] == before, "nothing rewrites a missing assignment"
+        # a missing narrator voice stays visible too
+        tab.cmb_narrator.clear()
+        tab.cmb_narrator.addItem("Missing: Lost", "Lost")
+        tab.cmb_narrator.setCurrentIndex(0)
+        tab.refresh_voices()
+        assert tab.cmb_narrator.currentData() == "Lost" and tab.cmb_narrator.currentText() == "Missing: Lost"
+        assert tab.status_narrator.state == cast_rules.MISSING
+        win.close()
+    print("PASS: Cast: missing voices, unknown keys and empty voices stay as they are, visible and flagged")
+
+
+def _test_cast_preflight_blocks_render_and_preview_before_licenses_and_models():
+    import audiobook
+    from unittest.mock import patch
+    with _AbVoices("Ana", "Bare", "Marcus"), _CastEnv(), _Patched():
+        _ab_edit_voice("Bare", csm_ref_text=None)
+        win, tab = _ab_tab(6)
+        tab.segments[2]["direction"] = ""
+        tab.segments[0]["voice"], tab.segments[1]["voice"], tab.segments[2]["voice"] = "csm:Bare", "csm:Bare", "xtts:Ana"
+        tab.segments[3]["voice"], tab.segments[4]["voice"] = "voice:Gone", ""
+        tab.rebuild(select=0)
+        calls, asked = [], []
+        os.environ.pop("COQUI_TOS_AGREED", None)
+
+        def fake_render(gen, segment, settings, cache_dir=None):
+            calls.append(segment["text"])
+            return np.full(2400, 0.1, dtype=np.float32), 24000
+
+        def no_question(*args, **kwargs):
+            asked.append(args)
+            return QtWidgets.QMessageBox.Yes
+        with patch.object(audiobook, "render_segment", fake_render), patch.object(QtWidgets.QMessageBox, "question", no_question):
+            tab.btn_render.click()
+            _wait_idle(win)
+            _app.processEvents()
+            assert calls == [] and asked == [], "no model work, and no license question, before every segment can be spoken"
+            dialog = tab._problem_dialog
+            assert dialog is not None and dialog.isVisible() and "Nothing was loaded" in win.lbl_status.text() or "Not rendered" in win.lbl_status.text()
+            groups = {g.cause: g for g in tab._problem_groups}
+            assert groups["setup:csm:transcript:Bare"].rows == (0, 1) and groups["missing:voice:Gone"].rows == (3,)
+            assert groups["setup:none:voice"].rows == (4,) and len(groups) == 3
+            assert tab._problem_groups[0].state == cast_rules.MISSING, "worst first"
+            buttons = [b for b in dialog.findChildren(QtWidgets.QPushButton) if b.text() == "Select these segments"]
+            assert len(buttons) == 3 and all(b.accessibleName() for b in buttons)
+            texts = " ".join(label.text() for label in dialog.findChildren(QtWidgets.QLabel))
+            assert "2 segments (1, 2)" in texts and "Reference transcript" in texts
+            [b for b in buttons if "transcript" in b.accessibleName().lower() or "Reference" in b.accessibleName()][0].click()
+            _app.processEvents()
+            assert tab.selected_rows() == [0, 1], tab.selected_rows()
+            win.activateWindow()
+            tab.select_segments([0, 1])
+            _app.processEvents()
+            assert tab.listw.hasFocus() or tab.listw.focusWidget() is not None, "the keyboard lands on the list"
+            # Preview checks the one segment the same way
+            _select_rows(tab, 4)
+            tab.btn_preview.click()
+            _wait_idle(win)
+            assert calls == [] and tab._problem_groups[0].rows == (4,), (calls, [(g.cause, g.rows) for g in tab._problem_groups], tab.selected_rows(), tab.btn_preview.isEnabled())
+            tab._problem_dialog.close()
+            # once the segments are fine, Render proceeds (and the license question is the next step, not the first)
+            for r in (0, 1, 2, 3, 4, 5):
+                tab.segments[r]["voice"] = "voice:Ana"
+            tab.rebuild(select=0)
+            tab.segments[2]["voice"] = "xtts:Ana"
+            tab.rebuild(select=0)
+            tab.btn_render.click()
+            _wait_idle(win)
+            assert asked and "XTTS" in asked[0][1], "licenses are asked only after the pre-flight passes"
+            _app.processEvents()
+        win.close()
+        os.environ.pop("COQUI_TOS_AGREED", None)
+    print("PASS: Cast: Render and Preview stop before licenses, models and rendering, group problems by cause, and select the affected segments")
+
+
+def _test_cast_role_markers_are_shapes_with_accessible_text():
+    with _AbVoices("Ana", "Marcus"), _CastEnv():
+        win, tab = _ab_tab(4)
+        delegate = tab.listw.itemDelegate()
+        row = tab.listw.sizeHintForRow(0)
+        images = {}
+        for r in (0, 1):                                          # 0 narration, 1 dialogue
+            pix = QtGui.QPixmap(300, row)
+            pix.fill(QtGui.QColor(theme.COLORS["surface"]))
+            painter = QtGui.QPainter(pix)
+            option = QtWidgets.QStyleOptionViewItem()
+            option.rect = QtCore.QRect(0, 0, 300, row)
+            option.font = tab.listw.font()
+            delegate.paint(painter, option, tab.listw.model().index(r, 0))
+            painter.end()
+            images[r] = pix.toImage().copy(delegate.NUM_W + 12, 0, delegate.ROLE_W, row)
+        background = QtGui.QColor(theme.COLORS["surface"]).name()
+        for image in images.values():
+            ink = [(x, y) for x in range(image.width()) for y in range(image.height()) if image.pixelColor(x, y).name() != background]
+            assert len(ink) > 20, "the role marker is drawn"
+        assert images[0] != images[1], "narration and dialogue differ by shape"
+        assert qt_audiobook.icons.icon("quote", 16, gap=0).availableSizes() or not qt_audiobook.icons.icon("quote").isNull()
+        assert " narration," in tab.listw.item(0).data(QtCore.Qt.AccessibleTextRole).lower().replace("segment 1,", " ")
+        assert ", dialogue," in tab.listw.item(1).data(QtCore.Qt.AccessibleTextRole)
+        assert tab.listw.item(1).data(qt_audiobook.ROLE_ROLE) == "D" and tab.listw.item(0).data(qt_audiobook.ROLE_ROLE) == "N"
+        win.close()
+    print("PASS: Cast: narration is an open book and dialogue a quotation mark, with the role also in the accessible text")
+
+
+def _test_cast_fits_both_window_sizes_and_keeps_render_in_view():
+    long_name = "A Very Long Voice Name For The Narrator Of Chapter Twelve"
+    with _AbVoices("Ana", "Bare", long_name), _CastEnv(xtts=False):
+        _ab_edit_voice("Bare", csm_ref_text=None)
+        for size in ((1024, 640), (1240, 780)):
+            win, tab = _ab_tab(27)
+            win.resize(*size)
+            tab.cmb_narrator.setCurrentIndex(tab.cmb_narrator.findData(long_name))
+            tab.cmb_dialogue.setCurrentIndex(tab.cmb_dialogue.findData("Bare"))
+            tab.on_role_changed("narrator")
+            _pick(tab.cmb_dialogue_engine, "csm")                  # the longest status text
+            tab.listw.setCurrentRow(3)
+            _app.processEvents()
+            scroll = tab.findChild(QtWidgets.QScrollArea)
+            assert scroll.horizontalScrollBar().maximum() == 0 and scroll.verticalScrollBar().maximum() == 0, size
+            tab.btn_settings.setChecked(True)                      # Render settings open: it may scroll down, never sideways
+            _app.processEvents()
+            assert scroll.horizontalScrollBar().maximum() == 0, (size, "settings open", scroll.horizontalScrollBar().maximum())
+            tab.btn_settings.setChecked(False)
+            _app.processEvents()
+            assert tab.btn_render.isVisible() and tab.rect().contains(QtCore.QRect(tab.btn_render.mapTo(tab, QtCore.QPoint(0, 0)), tab.btn_render.size()))
+            for w in (tab.cmb_narrator, tab.cmb_narrator_engine, tab.cmb_dialogue, tab.cmb_dialogue_engine, tab.status_narrator,
+                      tab.status_dialogue, tab.status_segment, tab.cmb_seg_voice, tab.cmb_seg_engine, tab.cmb_seg_direction):
+                box = QtCore.QRect(w.mapTo(tab, QtCore.QPoint(0, 0)), w.size())
+                assert tab.rect().contains(box) and w.width() >= (w.minimumWidth() or w.minimumSizeHint().width()), (size, w.accessibleName(), box)
+            assert tab.listw.viewport().height() / tab.listw.sizeHintForRow(0) >= 5.5, (size, tab.listw.viewport().height())
+            assert tab.status_dialogue.full_text().startswith("Needs setup"), tab.status_dialogue.full_text()
+            win.close()
+    print("PASS: Cast: nothing clips or scrolls at 1024x640 and 1240x780, long names and long reasons are elided, 5.5+ rows stay visible")
+
+
+def _test_cast_new_segments_never_get_an_impossible_combination():
+    with _AbVoices("Ana", "Marcus"), _CastEnv():
+        win, tab = _ab_tab(3)
+        _pick(tab.cmb_narrator_engine, "csm")
+        tab.cmb_lang.setCurrentText("french")
+        _app.processEvents()
+        assert tab.narrator_key() == "csm:Ana", "the role itself is kept, visible and editable"
+        assert tab.status_narrator.state == cast_rules.UNSUPPORTED
+        tab.txt_source.setPlainText('He said, "Hello." Then left.')
+        before = [dict(seg) for seg in tab.segments]
+        tab.auto_split()
+        assert tab.segments == before and "narrator engine cannot speak this" in win.lbl_status.text(), win.lbl_status.text()
+        win.lbl_status.setText("")
+        tab.add_after()
+        assert tab.segments == before and "narrator engine cannot speak this" in win.lbl_status.text()
+        _pick(tab.cmb_narrator_engine, "xtts")                      # xtts speaks French
+        tab.add_after()
+        assert len(tab.segments) == 4 and tab.segments[-1]["voice"] == "xtts:Ana" or tab.segments[1]["voice"] == "xtts:Ana"
+        win.close()
+    print("PASS: Cast: Split and Add after never stamp an impossible voice and engine onto a new segment")
+
+
+def _test_cast_problems_dialog_scrolls_and_keeps_close_reachable():
+    with _AbVoices("Ana", "Marcus"), _CastEnv():
+        win, tab = _ab_tab(12)
+        for i, seg in enumerate(tab.segments):
+            seg["voice"] = f"{('voice', 'xtts', 'csm')[i % 3]}:Gone {i}"      # twelve different causes
+        tab.rebuild(select=0)
+        tab.btn_render.click()
+        _app.processEvents()
+        dialog = tab._problem_dialog
+        assert dialog is not None and len(tab._problem_groups) == 12
+        screen_height = 640
+        assert dialog.height() <= screen_height, dialog.height()
+        scroll = dialog.findChild(QtWidgets.QScrollArea)
+        assert scroll.verticalScrollBar().maximum() > 0, "twelve groups scroll instead of running off the screen"
+        close = [b for b in dialog.findChildren(QtWidgets.QPushButton) if b.text() == "Close"][0]
+        assert dialog.rect().contains(QtCore.QRect(close.mapTo(dialog, QtCore.QPoint(0, 0)), close.size())) and close.isVisible()
+        dialog.close()
+        win.close()
+    print("PASS: Cast: a long list of problems scrolls inside the dialog and Close stays reachable")
+
+
+def _test_cast_engine_menu_is_keyboard_complete_and_the_choice_is_visible():
+    with _AbVoices("Ana", "Marcus"), _CastEnv():
+        win, tab = _ab_tab(4)
+        tab.segments[2]["direction"] = "sad"                       # xtts, csm, dia and f5 cannot speak a direction
+        tab.rebuild(select=2)
+        combo = tab.cmb_seg_engine
+        assert combo.count() == 5 and combo.currentData() == "qwen"
+        # every item has its state in its text and its reason in a tooltip; nothing depends on the popup being tall enough
+        assert all(combo.itemText(i) and combo.itemData(i, QtCore.Qt.ToolTipRole) for i in range(5))
+        # the keyboard reaches an enabled engine without the popup: Up/Down move through the enabled items only
+        tab.listw.setCurrentRow(1)
+        combo.setFocus()
+        QTest.keyClick(combo, QtCore.Qt.Key_Down)
+        _app.processEvents()
+        assert combo.currentData() in cast_rules.ENGINES
+        QTest.keyClick(combo, QtCore.Qt.Key_End)
+        combo.activated.emit(combo.currentIndex())
+        _app.processEvents()
+        chosen = combo.currentData()
+        assert tab.segments[1]["voice"].startswith(cast_rules.PREFIX[chosen] + ":"), (chosen, tab.segments[1]["voice"])
+        assert combo.currentText().startswith(cast_rules.LABEL[chosen]), "the closed box names the chosen engine"
+        assert cast_rules.LABEL[chosen] in tab.listw.item(1).data(QtCore.Qt.AccessibleTextRole) or chosen == "qwen"
+        # an engine that cannot speak the selected segment is skipped by the keyboard, never chosen
+        tab.listw.setCurrentRow(2)
+        combo.setFocus()
+        combo.setCurrentIndex(0)
+        for _ in range(6):
+            QTest.keyClick(combo, QtCore.Qt.Key_Down)
+        assert combo.currentData() == "qwen" and tab.segments[2]["voice"].startswith("voice:"), "disabled engines are skipped, so nothing else is reachable"
+        # the popup lists all five, and a disabled one still shows its reason
+        combo.showPopup()
+        _app.processEvents()
+        assert combo.view().model().rowCount() == 5
+        combo.hidePopup()
+        win.close()
+    print("PASS: Cast: the engine menu is keyboard complete (disabled engines skipped), and the chosen engine is shown in the box and the row")
+
+
+def _test_cast_rules_and_the_page_never_load_a_model():
+    import audiobook
+    import model_loader
+    from unittest.mock import patch
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a compatibility check must never load a model or start a task")
+    with _AbVoices("Ana", "Marcus"), _CastEnv(), patch.object(model_loader.ModelManager, "get", forbidden), \
+            patch.object(model_loader, "load_model", forbidden), patch.object(audiobook, "render_segment", forbidden):
+        win, tab = _ab_tab(5)
+        win.models.get = forbidden                                # the window's own model manager, not the class
+        win.run_task = forbidden                                  # nothing may start a task either
+        for engine in ("xtts", "csm", "dia", "f5", "qwen"):
+            _pick(tab.cmb_narrator_engine, engine)
+            tab.refresh_compat()
+        tab.cmb_lang.setCurrentText("french")
+        tab.refresh_voices()
+        _select_rows(tab, 0, 1)
+        _pick(tab.cmb_seg_engine, "xtts")
+        tab.segments[3]["voice"] = "csm:Bare"
+        tab.rebuild(select=3)
+        tab.btn_render.click()                                    # blocked by the pre-flight, so nothing is rendered
+        tab.btn_preview.click()
+        _app.processEvents()
+        assert tab._problem_dialog is not None
+        tab._problem_dialog.close()
+        assert "TTS" not in sys.modules and "f5_tts" not in sys.modules, "no engine package was imported"
+        win.close()
+    print("PASS: Cast: browsing, switching engines, changing language and a blocked Render never load a model, start a task or import an engine")
+
+
+def _test_cast_refresh_and_voice_choice_never_rewrite_the_cast():
+    with _AbVoices("Ana", "Marcus", "Zed"), _CastEnv():
+        win, tab = _ab_tab(3)
+        tab.cmb_narrator.setCurrentIndex(tab.cmb_narrator.findData("Ana"))
+        tab.cmb_dialogue.setCurrentIndex(tab.cmb_dialogue.findData("Ana"))
+        _pick(tab.cmb_dialogue_engine, "csm")                      # Ana/Qwen narrates, Ana/CSM speaks: a real cast
+        assert (tab.narrator_key(), tab.dialogue_key()) == ("voice:Ana", "csm:Ana")
+        for _ in range(2):
+            tab.refresh_voices()
+        assert (tab.narrator_key(), tab.dialogue_key()) == ("voice:Ana", "csm:Ana"), "a library refresh never changes the cast"
+        # a voice with no Qwen clone prompt moves its role to an engine that can use it, and says so
+        path = os.path.join(voice_library.voice_dir("Zed"), "clone_prompt.npz")
+        os.remove(path)
+        tab.cmb_narrator.setCurrentIndex(tab.cmb_narrator.findData("Zed"))
+        tab.cmb_narrator.activated.emit(tab.cmb_narrator.currentIndex())
+        _app.processEvents()
+        assert tab.narrator_key() == "xtts:Zed" and "Narrator engine set to XTTS: Zed has no Qwen clone prompt" in win.lbl_status.text(), \
+            (tab.narrator_key(), win.lbl_status.text())
+        win.close()
+    print("PASS: Cast: a library refresh never rewrites Narrator or Dialogue, and an automatic engine move is announced")
 
 
 def _test_multiline_editors_never_trap_the_keyboard():
@@ -2204,7 +2662,7 @@ def _test_stale_sample_callout_and_footer_status():
 _USED_ICONS = {"wand-sparkles", "copy", "mic-vocal", "book-open", "settings", "audio-lines", "play", "save",
                "download", "refresh-cw", "chevron-right", "chevron-down",
                "square", "folder-open", "circle-check", "circle-exclamation-point",
-               "pause", "rotate-ccw", "rotate-cw", "pencil", "info"}
+               "pause", "rotate-ccw", "rotate-cw", "pencil", "info", "quote"}
 
 
 def _test_icon_assets_are_vendored_licensed_and_only_the_used_ones():
@@ -4130,6 +4588,19 @@ def run_ui_tests():
     _test_audiobook_edits_split_merge_move_delete_and_project_round_trip_keep_voice_and_direction()
     _test_audiobook_typing_keeps_selection_caret_and_focus()
     _test_audiobook_keyboard_wheel_and_geometry_at_the_minimum_window()
+    _test_cast_voices_appear_once_and_engines_carry_their_state()
+    _test_cast_language_makes_engines_unavailable_but_never_rewrites_assignments()
+    _test_cast_direction_and_tags_follow_the_selection_and_block_new_assignments()
+    _test_cast_bulk_edits_keep_each_voice_and_each_engine()
+    _test_cast_missing_voices_are_preserved_and_flagged()
+    _test_cast_preflight_blocks_render_and_preview_before_licenses_and_models()
+    _test_cast_role_markers_are_shapes_with_accessible_text()
+    _test_cast_fits_both_window_sizes_and_keeps_render_in_view()
+    _test_cast_new_segments_never_get_an_impossible_combination()
+    _test_cast_problems_dialog_scrolls_and_keeps_close_reachable()
+    _test_cast_engine_menu_is_keyboard_complete_and_the_choice_is_visible()
+    _test_cast_rules_and_the_page_never_load_a_model()
+    _test_cast_refresh_and_voice_choice_never_rewrite_the_cast()
     _test_audiobook_rows_are_compact_readable_and_accessible()
     _test_audiobooks_page_opens_without_a_focused_button()
     _test_audiobook_render_and_preview_run_through_the_new_page()

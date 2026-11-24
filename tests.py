@@ -1486,6 +1486,174 @@ def _test_benchmark_helpers():
 
 # ------------------------------------------------------------------ runner
 
+def _cast_fixture(root, name, **config):
+    """A voice folder with the files the engines read; `config` overrides or (None) removes voice.json keys."""
+    import json
+    path = os.path.join(root, name)
+    os.makedirs(path)
+    seconds = config.pop("seconds", 2)
+    if seconds is not None:
+        write_wav(os.path.join(path, "reference.wav"), np.zeros(int(24000 * seconds)), 24000)
+    np.savez(os.path.join(path, "clone_prompt.npz"), x=np.zeros(1))
+    data = {"name": name, "description": "calm", "ref_audio": "reference.wav", "clone_prompt": "clone_prompt.npz",
+            "csm_ref_text": "Hello there."}
+    data.update(config)
+    data = {key: value for key, value in data.items() if value is not None}
+    with open(os.path.join(path, "voice.json"), "w", encoding="utf-8") as voice_file:
+        json.dump(data, voice_file)
+
+
+_ALL_READY = {"xtts": True, "csm": True, "dia": True, "f5": "ok"}
+
+
+def _test_cast_rules_states_and_reasons():
+    import tempfile
+    import cast_rules as cr
+
+    assert cr.parse_key("voice:Ana") == ("qwen", "Ana") and cr.parse_key("f5:A:b") == ("f5", "A:b")
+    assert cr.parse_key("") == (None, "") and cr.parse_key("Ana") == (None, "") and cr.parse_key("zzz:Ana") == (None, "")
+    assert all(cr.parse_key(cr.make_key(engine, "Ana")) == (engine, "Ana") for engine in cr.ENGINES)
+    with tempfile.TemporaryDirectory() as root:
+        _cast_fixture(root, "Ana")
+        _cast_fixture(root, "Bare", description="", csm_ref_text=None)
+        _cast_fixture(root, "Long", seconds=13)
+        _cast_fixture(root, "NoRef", seconds=None)
+        _cast_fixture(root, "NoPrompt", clone_prompt=None)
+        _cast_fixture(root, "OwnF5", f5_ref_audio="f5_reference.wav", f5_ref_text="Short words.")
+        write_wav(os.path.join(root, "OwnF5", "f5_reference.wav"), np.zeros(24000), 24000)
+        _cast_fixture(root, "OwnF5NoKey", f5_ref_audio="f5_reference.wav", f5_ref_text=None)
+        write_wav(os.path.join(root, "OwnF5NoKey", "f5_reference.wav"), np.zeros(24000), 24000)
+
+        def state(key, language="english", direction="", text="Hello.", env=_ALL_READY):
+            return cr.check(key, language, direction, text, root=root, env=env)
+
+        # Ready, with the honest note that only local facts were checked
+        for engine in cr.ENGINES:
+            result = state(cr.make_key(engine, "Ana"))
+            assert result.state == cr.READY and result.issues == () and cr.LOCAL_ONLY_NOTE in result.notes, engine
+        assert state("voice:Ana", language="auto", direction="whisper", text="[sad] Hi.").state == cr.READY
+        # unsupported combinations
+        assert state("xtts:Ana", language="auto").state == cr.UNSUPPORTED
+        assert state("xtts:Ana", language="german").state == cr.READY
+        for engine in ("csm", "dia"):
+            assert state(f"{engine}:Ana", language="french").state == cr.UNSUPPORTED
+        assert state("f5:Ana", language="chinese").state == cr.READY and state("f5:Ana", language="german").state == cr.UNSUPPORTED
+        for engine in ("xtts", "csm", "dia", "f5"):
+            direction = state(f"{engine}:Ana", direction="whisper")
+            tags = state(f"{engine}:Ana", text="[sad] Hi.")
+            assert direction.state == tags.state == cr.UNSUPPORTED and direction.issues[0].cause != tags.issues[0].cause
+            assert state(f"{engine}:Ana", text="Chapter [1] begins.").state == cr.READY, "[1] is not an emotion tag"
+        assert state("voice:Bare", text="[sad] Hi.").state == cr.UNSUPPORTED     # tags need a description
+        assert state("voice:Bare", text="Hi.").state == cr.READY
+        bare_direction = state("voice:Bare", direction="whisper", text="Hi.")  # a direction is sent as a leading [tag]
+        assert bare_direction.state == cr.UNSUPPORTED and "need a voice description" in bare_direction.message
+        assert state("voice:Bare", direction="[whisper]", text="Hi.").state == cr.UNSUPPORTED
+        assert state("voice:Ana", direction="whisper", text="Hi.").state == cr.READY
+        # needs setup: transcript, long F5 reference, packages; the assignment itself stays valid
+        for engine in ("csm", "dia", "f5"):
+            result = state(f"{engine}:Bare")
+            assert result.state == cr.SETUP and "transcript" in result.issues[0].message and "My Voices" in result.issues[0].message
+        assert state("xtts:Bare").state == cr.READY and state("voice:Bare").state == cr.READY
+        assert state("f5:Long").state == cr.SETUP and "12 s" in state("f5:Long").short
+        assert state("csm:Long").state == cr.READY, "the 12 s limit is F5's"
+        assert state("f5:OwnF5").state == cr.READY, "F5 uses its own short reference and transcript when it has one"
+        assert state("f5:OwnF5NoKey").state == cr.SETUP, "its own reference without its own transcript is not the CSM transcript"
+        assert state("csm:OwnF5NoKey").state == cr.READY
+        assert state("xtts:Ana", env={**_ALL_READY, "xtts": False}).state == cr.SETUP
+        assert state("csm:Ana", env={**_ALL_READY, "csm": False}).state == cr.SETUP
+        assert state("dia:Ana", env={**_ALL_READY, "dia": False}).state == cr.SETUP
+        assert state("f5:Ana", env={**_ALL_READY, "f5": "missing"}).state == cr.SETUP
+        unverified = state("f5:Ana", env={**_ALL_READY, "f5": "unverified"})
+        assert unverified.state == cr.READY and any("not inspected" in note for note in unverified.notes)
+        assert any("gated" in note for note in state("csm:Ana").notes) and any("license" in note for note in state("xtts:Ana").notes)
+        # missing: the voice, its reference, its prompt, or an entry this version does not know
+        assert state("voice:Gone").state == cr.MISSING and state("csm:Gone").state == cr.MISSING
+        assert state("xtts:NoRef").state == cr.MISSING and state("voice:NoRef").state == cr.READY
+        assert state("voice:NoPrompt").state == cr.MISSING and state("xtts:NoPrompt").state == cr.READY
+        assert state("legacy").state == cr.MISSING
+        assert state("").state == cr.SETUP and "no voice" in state("").short
+        # the worst state wins, and several causes are all reported
+        both = state("csm:Bare", language="french", direction="x")
+        assert both.state == cr.UNSUPPORTED and len(both.issues) >= 3
+        assert [cr.SEVERITY[item.state] for item in both.issues] == sorted((cr.SEVERITY[item.state] for item in both.issues), reverse=True)
+
+        # pre-flight groups segments by cause and names their rows
+        segments = [{"voice": "voice:Ana", "text": "Hi."}, {"voice": "csm:Bare", "text": "Hi."},
+                    {"voice": "csm:Bare", "text": "Again."}, {"voice": "voice:Gone", "text": "Hi."},
+                    {"voice": "dia:Bare", "text": "Hi."}, {"voice": "", "text": "Hi."}]
+        groups = cr.preflight(segments, "english", root=root, env=_ALL_READY)
+        by_cause = {group.cause: group for group in groups}
+        assert by_cause["setup:csm:transcript:Bare"].rows == (1, 2)
+        assert by_cause["setup:dia:transcript:Bare"].rows == (4,) and by_cause["missing:voice:Gone"].rows == (3,)
+        assert by_cause["setup:none:voice"].rows == (5,) and len(groups) == 4
+        assert groups[0].state == cr.MISSING, "worst first"
+        assert cr.preflight(segments[:1], "english", root=root, env=_ALL_READY) == []
+        assert cr.preflight(segments[1:3], "english", rows=[7, 9], root=root, env=_ALL_READY)[0].rows == (7, 9)
+        # a memo is only a cache of file reads
+        memo = {}
+        assert cr.preflight(segments, "english", root=root, env=_ALL_READY, memo=memo) == groups and memo
+    print("PASS: cast rules: ready, needs setup, unsupported and missing states, reasons, notes and grouped pre-flight")
+
+
+def _test_cast_rules_agree_with_the_engines_before_any_model_loads():
+    """For every case the engines would reject on their own checks, cast_rules must not say Ready, and the other way
+    round. The model manager raises a sentinel the moment an engine asks for a model, so the engine's own validation
+    (the part that must match) is exactly what runs."""
+    import itertools
+    import tempfile
+    from unittest.mock import patch
+    import audiobook
+    import cast_rules as cr
+    import tts_generator
+    import voice_library
+
+    class Reached(Exception):
+        pass
+
+    class Models:
+        def get(self, kind, notify=None):
+            raise Reached(kind)
+
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache:
+        _cast_fixture(root, "Ana")
+        _cast_fixture(root, "Bare", csm_ref_text=None)
+        _cast_fixture(root, "Long", seconds=13)
+        _cast_fixture(root, "NoRef", seconds=None)
+        _cast_fixture(root, "OwnF5", f5_ref_audio="f5_reference.wav", f5_ref_text="Short words.")
+        write_wav(os.path.join(root, "OwnF5", "f5_reference.wav"), np.zeros(24000), 24000)
+        _cast_fixture(root, "OwnF5NoText", f5_ref_audio="f5_reference.wav", f5_ref_text="", csm_ref_text="Fine.")
+        write_wav(os.path.join(root, "OwnF5NoText", "f5_reference.wav"), np.zeros(24000), 24000)
+        _cast_fixture(root, "OwnF5NoKey", f5_ref_audio="f5_reference.wav", f5_ref_text=None, csm_ref_text="Fine.")
+        write_wav(os.path.join(root, "OwnF5NoKey", "f5_reference.wav"), np.zeros(24000), 24000)
+        _cast_fixture(root, "NoPrompt", clone_prompt=None)
+        names = ("Ana", "Bare", "Long", "NoRef", "OwnF5", "OwnF5NoText", "OwnF5NoKey", "NoPrompt", "Gone")
+        checked = refused_cases = accepted_cases = 0
+        with patch.object(voice_library, "VOICES_DIR", root), patch.object(tts_generator, "seed_everything"):
+            generator = tts_generator.TTSGenerator(Models(), notify=lambda message: None)
+            for engine, name, language, direction, text in itertools.product(
+                    cr.ENGINES, names, ("english", "chinese", "auto", "french"), ("", "whisper"),
+                    ("Hello there.", "[sad] Hello there.")):
+                if engine == "qwen" and (direction or "[" in text):
+                    continue    # Qwen checks direction and tags only after its model loads: covered by the unit cases
+                segment = audiobook.new_segment(text, cr.make_key(engine, name), direction=direction)
+                settings = {"language": language, "seed": 1, "temperature": 0.7, "min_words": 1, "max_words": 50}
+                try:
+                    audiobook.render_segment(generator, segment, settings, cache_dir=cache)
+                    refused = False
+                except Reached:
+                    refused = False
+                except Exception:
+                    refused = True
+                state = cr.check_segment(segment, language, root=root, env=_ALL_READY).state
+                assert (state != cr.READY) == refused, (engine, name, language, direction, text, state, refused)
+                checked += 1
+                refused_cases += refused
+                accepted_cases += not refused
+    assert refused_cases > 100 and accepted_cases > 50, (refused_cases, accepted_cases)    # the comparison is not vacuous
+    print(f"PASS: cast rules agree with the real qwen (files), xtts, csm, dia and f5 validation in all {checked} cases "
+          f"({refused_cases} refused, {accepted_cases} accepted; no model loaded)")
+
+
 def run_tests():
     """Run all unit tests."""
     print("Running unit tests...")
@@ -1514,6 +1682,8 @@ def run_tests():
     _test_csm_generation()
     _test_dia_generation()
     _test_f5_generation_and_worker()
+    _test_cast_rules_states_and_reasons()
+    _test_cast_rules_agree_with_the_engines_before_any_model_loads()
     _test_engine_model_lifecycle()
     _test_voice_library_roundtrip()
     _test_voice_replace_is_failure_safe()
