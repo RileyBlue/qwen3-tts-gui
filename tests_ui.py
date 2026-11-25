@@ -111,10 +111,10 @@ class _Patched:
 def _test_window_builds_with_sidebar_navigation():
     win, stub = _make_window()
     labels = [b.text() for b in win.nav_buttons]
-    assert labels == ["Create Voice", "Clone Voice", "My Voices", "Audiobooks", "Settings"], labels
-    assert win.stack.count() == 5 and win.stack.currentIndex() == 0
+    assert labels == ["Create Voice", "Clone Voice", "My Voices", "Audiobooks", "Drama Studio", "Settings"], labels
+    assert win.stack.count() == 6 and win.stack.currentIndex() == 0
     assert win.nav_buttons[0].isChecked()
-    assert win.nav_buttons[-1] is win.nav_buttons[4], "Settings is last (bottom of the sidebar)"
+    assert win.nav_buttons[-1] is win.nav_buttons[5], "Settings is last (bottom of the sidebar)"
     assert stub.calls == []
     print("PASS: window builds with sidebar navigation, no model touched")
 
@@ -125,7 +125,7 @@ def _test_navigation_switches_pages():
         btn.click()
         assert win.stack.currentIndex() == i
         assert [b.isChecked() for b in win.nav_buttons].count(True) == 1 and btn.isChecked()
-    assert win.stack.widget(4).isAncestorOf(win.cmb_attn)
+    assert win.stack.widget(5).isAncestorOf(win.cmb_attn)
     print("PASS: sidebar buttons switch pages and stay exclusive")
 
 
@@ -805,10 +805,10 @@ def _test_leaving_a_navigation_item_never_leaves_its_focus_ring_behind():
         for how in ("shortcut", "mouse"):
             win.show_page(0)
             win.nav_buttons[0].setFocus()
-            for _ in range(4):
+            for _ in range(5):
                 QTest.keyClick(win.windowHandle(), QtCore.Qt.Key_Down)   # arrows move between items
             _app.processEvents()
-            assert win.stack.currentIndex() == 4 and win.focusWidget() is settings
+            assert win.stack.currentIndex() == 5 and win.focusWidget() is settings
             if how == "shortcut":
                 QTest.keyClick(win.windowHandle(), QtCore.Qt.Key_1, QtCore.Qt.ControlModifier)
             else:
@@ -865,7 +865,7 @@ def _test_navigation_ring_follows_keyboard_focus_only():
             edge += [image.pixelColor(x, y).name().upper() for y in (1, image.height() - 2) for x in range(8, image.width() - 8)]
             return accent in edge
 
-        for index in (0, 2, 4):                      # any selected page, with and without focus
+        for index in (0, 2, 5):                      # any selected page, with and without focus
             win.show_page(index)
             win.nav_buttons[index].clearFocus()
             win.setFocus()
@@ -881,10 +881,10 @@ def _test_navigation_ring_follows_keyboard_focus_only():
         win.show_page(0)
         assert win.focusWidget() is win.nav_buttons[0] and ring(win.nav_buttons[0])
         assert not any(ring(b) for b in win.nav_buttons[1:])
-        QTest.mouseClick(win.nav_buttons[4], QtCore.Qt.LeftButton)   # a mouse click selects without a ring on Settings
+        QTest.mouseClick(win.nav_buttons[5], QtCore.Qt.LeftButton)   # a mouse click selects without a ring on Settings
         win.nav_buttons[0].clearFocus()
         win.setFocus()
-        assert not ring(win.nav_buttons[4])
+        assert not ring(win.nav_buttons[5])
         win.close()
     print("PASS: the navigation ring appears only for keyboard focus, never for selection alone, and never stays on a deselected item")
 
@@ -963,7 +963,7 @@ def _test_footer_actions_match_what_they_can_do():
     win, _ = _make_window()
     win.show_page(0)
     assert win.btn_play_last.isHidden(), "Create Voice has its own Play"
-    for i in (1, 2, 3, 4):
+    for i in (1, 2, 3, 4, 5):
         win.show_page(i)
         assert not win.btn_play_last.isHidden()
     win.show_page(0)
@@ -981,7 +981,7 @@ def _test_footer_actions_match_what_they_can_do():
 
 def _test_settings_page_separates_scopes():
     win, _ = _make_window()
-    page = win.stack.widget(4)
+    page = win.stack.widget(5)
     for w in (win.cmb_device, win.cmb_dtype, win.cmb_attn, win.spn_min, win.spn_max):
         assert page.isAncestorOf(w)
     texts = [l.text() for l in page.findChildren(QtWidgets.QLabel)]
@@ -2729,7 +2729,7 @@ def _test_create_voice_and_navigation_icons_never_replace_labels():
         assert button.text().strip(), "icons never replace the text label"
         need = button.fontMetrics().horizontalAdvance(button.text()) + button.iconSize().width() + 16
         assert button.width() >= need, f"{button.text()!r} clips its text next to the icon"
-    assert [b.text() for b in win.nav_buttons] == ["Create Voice", "Clone Voice", "My Voices", "Audiobooks", "Settings"]
+    assert [b.text() for b in win.nav_buttons] == ["Create Voice", "Clone Voice", "My Voices", "Audiobooks", "Drama Studio", "Settings"]
     assert win.btn_vd_generate.text() == "Generate voice" and win.btn_vd_generate.accessibleName() in ("", "Generate voice")
     assert all(chip.icon().isNull() for chip, _n, _p in win.vd_chips), "suggestion chips stay text-only"
     # the disclosure says its state in words too, not by chevron alone
@@ -3740,8 +3740,8 @@ def _test_numeric_fields_share_one_style_and_keep_their_behavior():
             ("Audiobook pause", at.spn_pause, 0, 5000, 50, 350, " ms", at.cmb_seed_mode, 3),
             ("Audiobook seed", at.spn_seed, 0, 2**31 - 1, 1, 42, "", at.cmb_seed_mode, 3),
             ("Audiobook temperature", at.spn_temp, 0.1, 1.5, 0.05, 0.7, "", at.cmb_seed_mode, 3),
-            ("Min words", win.spn_min, 0, 5000, 1, 200, "", win.cmb_device, 4),
-            ("Max words", win.spn_max, 0, 5000, 1, 250, "", win.cmb_device, 4),
+            ("Min words", win.spn_min, 0, 5000, 1, 200, "", win.cmb_device, 5),
+            ("Max words", win.spn_max, 0, 5000, 1, 250, "", win.cmb_device, 5),
         ]
         win.resize(1240, 780)
         win.show()
