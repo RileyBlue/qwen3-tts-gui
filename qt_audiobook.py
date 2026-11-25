@@ -585,10 +585,13 @@ class AudiobookTab(QtWidgets.QWidget):
     def refresh_voices(self):
         self._loading = True
         try:
+            had_dialogue = self.cmb_dialogue.currentData() is not None
             for cmb in (self.cmb_narrator, self.cmb_dialogue):
                 current = cmb.currentData()
                 self._fill_names(cmb, current, first_by_default=True)
-            if self.dialogue_key() == self.narrator_key():     # the same voice AND engine; Ana/Qwen with Ana/CSM is a real cast
+            # Only the first fill picks a different default Dialogue voice. Once a person has chosen, a refresh never
+            # moves either role, even when both name the same voice and engine (one reader for the whole book).
+            if not had_dialogue and self.dialogue_key() == self.narrator_key():
                 for index in range(self.cmb_dialogue.count()):
                     if self.cmb_dialogue.itemData(index) != self.cmb_narrator.currentData():
                         self.cmb_dialogue.setCurrentIndex(index)

@@ -2546,6 +2546,55 @@ def _test_voice_refresh_keeps_audiobooks_and_drama_studio_independent():
     print("PASS: a voice-library refresh keeps Audiobooks and Drama Studio selections independent")
 
 
+def _test_narrator_and_dialogue_on_the_same_voice_and_engine_stay_independent():
+    with _AbVoices("Ana", "Marcus", "Zed"), _CastEnv():
+        win, tab = _ab_tab(3)
+        _pick(tab.cmb_narrator, "Ana")
+        _pick(tab.cmb_dialogue, "Ana")                    # one reader for the whole book: both roles, same voice and engine
+        assert tab.narrator_key() == tab.dialogue_key() == "voice:Ana"
+        for _ in range(3):
+            tab.refresh_voices()
+            win.refresh_voice_lists()
+        assert (tab.narrator_key(), tab.dialogue_key()) == ("voice:Ana", "voice:Ana"), "a refresh never moves either role"
+        # editing one role leaves the other alone, in both directions and for both controls
+        _pick(tab.cmb_narrator, "Marcus")
+        assert (tab.narrator_key(), tab.dialogue_key()) == ("voice:Marcus", "voice:Ana")
+        _pick(tab.cmb_narrator, "Ana")
+        _pick(tab.cmb_dialogue_engine, "csm")
+        assert (tab.narrator_key(), tab.dialogue_key()) == ("voice:Ana", "csm:Ana")
+        _pick(tab.cmb_dialogue_engine, "qwen")
+        _pick(tab.cmb_dialogue, "Zed")
+        assert (tab.narrator_key(), tab.dialogue_key()) == ("voice:Ana", "voice:Zed")
+        _pick(tab.cmb_dialogue, "Ana")
+        assert (tab.narrator_key(), tab.dialogue_key()) == ("voice:Ana", "voice:Ana")
+        # splitting uses each role's own assignment, and a saved project keeps every segment's voice
+        tab.txt_source.setPlainText('He waited. "Not yet," she said. Then nothing.')
+        tab.segments = []
+        tab.rebuild(select=0)                              # nothing to replace, so no confirmation dialog
+        tab.auto_split()
+        kinds = {s["kind"]: s["voice"] for s in tab.segments}
+        assert kinds.get("narration") == "voice:Ana" and kinds.get("dialogue") == "voice:Ana", kinds
+        _pick(tab.cmb_dialogue, "Marcus")                 # later segments differ from earlier ones; both must survive
+        tab.segments[0]["voice"] = "voice:Zed"
+        saved = [dict(s) for s in tab.segments]
+        target = os.path.join(tempfile.mkdtemp(), "book.json")
+        real = QtWidgets.QFileDialog.getSaveFileName, QtWidgets.QFileDialog.getOpenFileName
+        try:
+            QtWidgets.QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (target, ""))
+            QtWidgets.QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (target, ""))
+            tab.save_project()
+            tab.segments = []
+            tab.rebuild(select=0)
+            tab.load_project()
+        finally:
+            QtWidgets.QFileDialog.getSaveFileName, QtWidgets.QFileDialog.getOpenFileName = real
+        assert tab.segments == saved, "save and load keep every segment's own voice, whichever role it came from"
+        tab.refresh_voices()
+        assert tab.segments == saved and tab.dialogue_key() == "voice:Marcus", "a refresh after loading changes nothing"
+        win.close()
+    print("PASS: Narrator and Dialogue on the same voice and engine stay independent through refresh, edits, split, save and load")
+
+
 def _test_cast_refresh_and_voice_choice_never_rewrite_the_cast():
     with _AbVoices("Ana", "Marcus", "Zed"), _CastEnv():
         win, tab = _ab_tab(3)
@@ -4627,6 +4676,7 @@ def run_ui_tests():
     _test_cast_engine_menu_is_keyboard_complete_and_the_choice_is_visible()
     _test_cast_rules_and_the_page_never_load_a_model()
     _test_cast_refresh_and_voice_choice_never_rewrite_the_cast()
+    _test_narrator_and_dialogue_on_the_same_voice_and_engine_stay_independent()
     _test_voice_refresh_keeps_audiobooks_and_drama_studio_independent()
     _test_audiobook_rows_are_compact_readable_and_accessible()
     _test_audiobooks_page_opens_without_a_focused_button()

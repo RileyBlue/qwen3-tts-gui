@@ -32,6 +32,9 @@ A Qwen direction is sent as a leading `[tag]`, so it needs the same voice descri
 ## How the page uses it
 
 - Voice first: each saved voice is listed once; the Engine is a second control that shows every engine with its state.
+- Narrator and Dialogue may use the same voice and engine (one reader for the whole book). A refresh of the voice list
+  never moves either role; only the very first fill picks a different default Dialogue voice. Roles are defaults for new
+  splits and are not saved in a project: a project stores each segment's own voice, which is saved and loaded as is.
 - Bulk edits keep each segment's other half: a new voice keeps each engine, a new engine keeps each voice.
 - Render and Preview run the pre-flight first, group problems by cause and offer to select the affected segments.
   Nothing is loaded and no licence is asked until it passes.
