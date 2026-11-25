@@ -1,7 +1,7 @@
 # Audiobooks: Cast and voice compatibility
 
 What the Audiobooks page checks before it renders, and why. The rules live in `cast_rules.py` (pure and read-only: it
-reads `voice.json`, checks that files exist, reads a WAV header, and asks which packages this Python can import; it
+reads `voice.json`, checks that files exist, reads an audio header, and asks which packages this Python can import; it
 loads no model and writes nothing). A segment still stores `"<engine>:<voice name>"` (Qwen uses `voice:`), so projects,
 the segment cache and rendering are unchanged.
 
@@ -21,7 +21,7 @@ pre-flight passes.
 
 | | Qwen | XTTS | CSM | Dia | F5-TTS |
 |---|---|---|---|---|---|
-| Reads | clone prompt | reference WAV | reference WAV + `csm_ref_text` | reference WAV + `csm_ref_text` | `f5_ref_audio` + `f5_ref_text`, else reference WAV + `csm_ref_text` |
+| Reads | clone prompt | reference audio | reference audio + `csm_ref_text` | reference audio + `csm_ref_text` | `f5_ref_audio` + `f5_ref_text`, else reference audio + `csm_ref_text` |
 | Languages | all | 10 (not auto) | English | English | English, Chinese |
 | Direction | yes | no | no | no | no |
 | `[emotion]` tags | yes, if the voice has a description | no | no | no | no |
@@ -37,6 +37,14 @@ A Qwen direction is sent as a leading `[tag]`, so it needs the same voice descri
   Nothing is loaded and no licence is asked until it passes.
 - Edits that make an assignment invalid (a direction, a tag, the Language) are flagged on the row and blocked at render,
   not prevented while typing.
+
+## Reference audio
+
+CSM, Dia and F5 read their reference with `audio_utils.load_wav`: standard-library PCM WAV first, then `soundfile`
+(float and 24-bit WAV, FLAC, MP3, OGG). The pre-flight reads only the header with the same two steps and never decodes.
+It is deliberately stricter in one case: a file that is empty, or cut off so that under 0.1 s of audio is really there,
+is reported as unreadable although `load_wav` would hand the engine almost no samples. Frames the header claims but the
+file does not contain are not counted (this matters for the F5 12 s limit).
 
 ## Not verified
 

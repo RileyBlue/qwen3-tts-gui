@@ -1,6 +1,7 @@
 """Unit tests for Qwen3-TTS GUI modules."""
 
 import os
+import shutil
 import sys
 import tempfile
 import wave
@@ -1595,6 +1596,99 @@ def _test_cast_rules_states_and_reasons():
     print("PASS: cast rules: ready, needs setup, unsupported and missing states, reasons, notes and grouped pre-flight")
 
 
+def _test_cast_rules_reference_audio_agrees_with_load_wav():
+    """cast_rules judges a reference from its header; audio_utils.load_wav is what the engines really call."""
+    import struct
+    import tempfile
+    import soundfile as sf
+    import audio_utils
+    import cast_rules as cr
+
+    tone = (0.4 * np.sin(2 * np.pi * 220 * np.arange(24000) / 24000)).astype("float32")
+    with tempfile.TemporaryDirectory() as tmp:
+        cases = {}                                           # file name -> should load_wav accept it
+
+        def audio(name, data=tone, rate=24000, **kw):
+            sf.write(os.path.join(tmp, name), data, rate, **kw)
+            cases[name] = True
+        write_wav(os.path.join(tmp, "pcm16.wav"), tone, 24000)
+        cases["pcm16.wav"] = True
+        audio("pcm8.wav", subtype="PCM_U8")
+        audio("pcm24.wav", subtype="PCM_24")
+        audio("pcm32.wav", subtype="PCM_32")
+        audio("float32.wav", subtype="FLOAT")
+        audio("float64.wav", subtype="DOUBLE")
+        audio("stereo_float.wav", np.stack([tone, -tone], axis=1), subtype="FLOAT")
+        audio("tone.flac", subtype="PCM_24")
+        audio("tone.ogg")
+        if "MP3" in sf.available_formats():
+            audio("tone.mp3")
+        audio("long.wav", np.zeros(24000 * 13, dtype="float32"), subtype="FLOAT")
+        # inputs load_wav refuses: empty, damaged, wrong content, truncated header, missing
+        audio("empty_frames.wav", np.zeros(0, dtype="float32"))
+        cases["empty_frames.wav"] = True    # load_wav returns zero samples without raising (stdlib path); see below
+        for name, payload in (("zero_bytes.wav", b""), ("text.wav", b"not audio at all"),
+                              ("riff_only.wav", b"RIFF" + struct.pack("<I", 4) + b"WAVE"), ("voice.m4a", b"\x00" * 64)):
+            with open(os.path.join(tmp, name), "wb") as handle:
+                handle.write(payload)
+            cases[name] = False
+        with open(os.path.join(tmp, "pcm16.wav"), "rb") as handle:
+            head = handle.read(300)
+        with open(os.path.join(tmp, "cut_header.wav"), "wb") as handle:
+            handle.write(head[:30])
+        cases["cut_header.wav"] = False
+        # cut off mid-data: the header is intact and still claims the full length (an interrupted copy)
+        write_wav(os.path.join(tmp, "pcm16_long.wav"), np.zeros(24000 * 13, dtype="float32"), 24000)
+        long_pcm = open(os.path.join(tmp, "pcm16_long.wav"), "rb").read()
+        for name, size in (("cut_tiny.wav", 44 + 100), ("cut_half.wav", 44 + 24000 * 2 * 5)):
+            with open(os.path.join(tmp, name), "wb") as handle:
+                handle.write(long_pcm[:size])
+            cases[name] = True
+        cases["missing.wav"] = False
+        assert any(ok for ok in cases.values()) and not all(cases.values()), "the fixtures must cover both outcomes"
+
+        for name, ok in cases.items():
+            path = os.path.join(tmp, name)
+            try:
+                audio_utils.load_wav(path)
+                loads = True
+            except (audio_utils.AudioReadError, OSError):
+                loads = False
+            assert loads == ok, f"{name}: load_wav {'read' if loads else 'refused'} it, the fixture says {ok}"
+            seconds = cr._audio_seconds(path, None)
+            if name in ("empty_frames.wav", "cut_tiny.wav"):
+                # Deliberately stricter than load_wav, which hands the engine zero samples: a silent no-op reference
+                # would only fail later, so the pre-flight says so now.
+                assert len(audio_utils.load_wav(path)[0]) < 0.1 * 24000 and seconds is None
+                continue
+            assert (seconds is not None) == loads, f"{name}: cast_rules says {seconds}, load_wav {loads}"
+            if loads:
+                assert abs(seconds - len(audio_utils.load_wav(path)[0]) / audio_utils.load_wav(path)[1]) < 0.01, name
+        # through check(): a readable float / 24-bit reference is Ready, an unreadable one needs setup
+        for name, ready in (("float32.wav", True), ("pcm24.wav", True), ("tone.flac", True), ("text.wav", False),
+                            ("empty_frames.wav", False), ("long.wav", True), ("cut_tiny.wav", False), ("cut_half.wav", True)):
+            voice = "V_" + name.replace(".", "_")
+            _cast_fixture(tmp, voice, seconds=None, ref_audio=name)
+            shutil.copy(os.path.join(tmp, name), os.path.join(tmp, voice, name))
+            for engine in ("csm", "dia", "f5"):
+                result = cr.check(f"{engine}:{voice}", "english", "", "Hello.", root=tmp, env=_ALL_READY)
+                if name == "long.wav" and engine == "f5":
+                    assert result.state == cr.SETUP and "over 12" in result.short, result.short
+                else:
+                    assert (result.state == cr.READY) == ready, (engine, name, result.state, result.short)
+                if not ready:
+                    assert result.short == "reference unreadable", result.short
+        # nothing was decoded: the header read must not call load_wav
+        original = audio_utils.load_wav
+        audio_utils.load_wav = lambda *a, **k: (_ for _ in ()).throw(AssertionError("pre-flight decoded a file"))
+        try:
+            assert cr._audio_seconds(os.path.join(tmp, "float32.wav"), None) is not None
+        finally:
+            audio_utils.load_wav = original
+    print(f"PASS: cast rules read references the way load_wav does ({len(cases)} files: PCM 8/16/24/32-bit, float, "
+          "FLAC, OGG, MP3, empty, damaged, missing), from the header only")
+
+
 def _test_cast_rules_agree_with_the_engines_before_any_model_loads():
     """For every case the engines would reject on their own checks, cast_rules must not say Ready, and the other way
     round. The model manager raises a sentinel the moment an engine asks for a model, so the engine's own validation
@@ -1683,6 +1777,7 @@ def run_tests():
     _test_dia_generation()
     _test_f5_generation_and_worker()
     _test_cast_rules_states_and_reasons()
+    _test_cast_rules_reference_audio_agrees_with_load_wav()
     _test_cast_rules_agree_with_the_engines_before_any_model_loads()
     _test_engine_model_lifecycle()
     _test_voice_library_roundtrip()

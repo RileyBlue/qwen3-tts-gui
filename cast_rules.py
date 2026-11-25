@@ -2,7 +2,7 @@
 
 A segment's voice is the string "<prefix>:<voice name>" (Qwen uses the prefix "voice"). This module answers, for one
 key, language, direction and text, which of four states applies, and why. It reads voice.json, checks that reference
-files exist and, for the F5 limit, reads a WAV header. It never imports an engine, loads a model, opens the network or
+files exist and, for the F5 limit, reads an audio header. It never imports an engine, loads a model, opens the network or
 writes anything, and it changes no schema: keys, voice.json and projects are exactly what the engines already use.
 
     READY        every requirement that can be checked locally is met (model download and gated access are not)
@@ -163,16 +163,41 @@ def _file_state(path, memo):
     return found
 
 
-def _wav_seconds(path, memo):
-    """Duration in seconds, or None when the file is not a PCM WAV this app can read."""
-    key = ("wav", path)
+MIN_REFERENCE_SECONDS = 0.1
+
+
+def _audio_seconds(path, memo):
+    """Duration in seconds from the file header, or None when audio_utils.load_wav could not read the file.
+
+    Mirrors load_wav without decoding it: the standard library first (8/16/32-bit PCM WAV), then soundfile for
+    anything else (float or 24-bit WAV, FLAC, MP3, OGG). Only headers are read, so this stays cheap.
+    """
+    key = ("audio", path)
     if memo is not None and key in memo:
         return memo[key]
+    seconds = None
     try:
-        with wave.open(path, "rb") as handle:
-            seconds = handle.getnframes() / handle.getframerate()
-    except (wave.Error, EOFError, OSError, ZeroDivisionError):
+        with open(path, "rb") as source, wave.open(source, "rb") as handle:
+            if handle.getsampwidth() in (1, 2, 4):
+                # The header's frame count is trusted by the standard library even when the file was cut short
+                # (an interrupted copy), so count only the frames that are really there.
+                frame_bytes = handle.getnchannels() * handle.getsampwidth()
+                present = max(0, os.path.getsize(path) - source.tell()) // frame_bytes
+                seconds = min(handle.getnframes(), present) / handle.getframerate()
+            else:
+                raise wave.Error("sample width load_wav hands to soundfile")
+    except (wave.Error, EOFError, ValueError, ZeroDivisionError):
         seconds = None
+        try:
+            import soundfile
+            info = soundfile.info(path)
+            seconds = info.frames / info.samplerate
+        except Exception:
+            seconds = None
+    except OSError:
+        seconds = None
+    if seconds is not None and seconds < MIN_REFERENCE_SECONDS:
+        seconds = None   # empty or cut off to nothing: load_wav would hand the engine (almost) no samples
     if memo is not None:
         memo[key] = seconds
     return seconds
@@ -266,11 +291,11 @@ def check(key, language, direction="", text="", root=None, env=None, memo=None):
             issues.append(Issue(MISSING, f"missing:reference:{name}", "reference missing",
                                 f"The reference recording for {name} is missing. Choose another voice, or add it again in My Voices."))
         elif engine in ("csm", "dia", "f5"):
-            seconds = _wav_seconds(reference, memo)
+            seconds = _audio_seconds(reference, memo)
             if seconds is None:
-                issues.append(Issue(SETUP, f"setup:{engine}:wav:{name}", "reference not PCM WAV",
-                                    f"{label} reads the reference as a PCM WAV and {name}'s is not one. Use a PCM WAV reference."))
-            elif engine == "f5" and (seconds <= 0 or seconds > F5_MAX_SECONDS):
+                issues.append(Issue(SETUP, f"setup:{engine}:wav:{name}", "reference unreadable",
+                                    f"{label} could not read the reference recording for {name}: it is empty or damaged, or in a format this computer can't decode. Add it again in My Voices."))
+            elif engine == "f5" and seconds > F5_MAX_SECONDS:
                 issues.append(Issue(SETUP, f"setup:f5:length:{name}", "reference over 12 s",
                                     f"F5-TTS needs a reference of {F5_MAX_SECONDS} s or less and {name}'s is {seconds:.0f} s. "
                                     f"In My Voices, select {name}, then Engine references > F5 reference…"))
