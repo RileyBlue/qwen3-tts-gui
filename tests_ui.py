@@ -2522,6 +2522,30 @@ def _test_cast_rules_and_the_page_never_load_a_model():
     print("PASS: Cast: browsing, switching engines, changing language and a blocked Render never load a model, start a task or import an engine")
 
 
+def _test_voice_refresh_keeps_audiobooks_and_drama_studio_independent():
+    with _AbVoices("Ana", "Marcus", "Zed"), _CastEnv():
+        win, tab = _ab_tab(3)
+        drama = win.drama_tab
+        tab.cmb_narrator.setCurrentIndex(tab.cmb_narrator.findData("Ana"))
+        tab.cmb_dialogue.setCurrentIndex(tab.cmb_dialogue.findData("Marcus"))
+        win.refresh_voice_lists()
+        drama.char_voice.setCurrentIndex(drama.char_voice.findData("Zed"))
+        keys = (tab.narrator_key(), tab.dialogue_key())
+        segments = [dict(s) for s in tab.segments]
+        win.refresh_voice_lists()
+        assert drama.char_voice.currentData() == "Zed", "Drama Studio keeps its own selection"
+        assert (tab.narrator_key(), tab.dialogue_key()) == keys and tab.segments == segments, \
+            "Drama Studio's selection never reaches the Audiobooks cast"
+        tab.cmb_narrator.setCurrentIndex(tab.cmb_narrator.findData("Marcus"))
+        win.refresh_voice_lists()
+        assert drama.char_voice.currentData() == "Zed", "an Audiobooks choice never reaches Drama Studio"
+        shutil.rmtree(voice_library.voice_dir("Zed"))            # a voice that disappears: Drama falls back, Cast keeps its keys
+        win.refresh_voice_lists()
+        assert drama.char_voice.currentData() == "" and tab.narrator_key() == "voice:Marcus"
+        win.close()
+    print("PASS: a voice-library refresh keeps Audiobooks and Drama Studio selections independent")
+
+
 def _test_cast_refresh_and_voice_choice_never_rewrite_the_cast():
     with _AbVoices("Ana", "Marcus", "Zed"), _CastEnv():
         win, tab = _ab_tab(3)
@@ -3755,6 +3779,8 @@ def _test_numeric_fields_share_one_style_and_keep_their_behavior():
             win.show_page(page)
             if page == 0:
                 win.btn_vd_advanced.setChecked(True)
+            if page == 3:
+                at.btn_settings.setChecked(True)      # Audiobooks keeps these in its collapsed Render settings
             _app.processEvents()
             original_mode = neighbour.currentText() if neighbour.findText("Fixed") >= 0 else None
             if original_mode:
@@ -4601,6 +4627,7 @@ def run_ui_tests():
     _test_cast_engine_menu_is_keyboard_complete_and_the_choice_is_visible()
     _test_cast_rules_and_the_page_never_load_a_model()
     _test_cast_refresh_and_voice_choice_never_rewrite_the_cast()
+    _test_voice_refresh_keeps_audiobooks_and_drama_studio_independent()
     _test_audiobook_rows_are_compact_readable_and_accessible()
     _test_audiobooks_page_opens_without_a_focused_button()
     _test_audiobook_render_and_preview_run_through_the_new_page()
